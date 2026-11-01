@@ -5,10 +5,12 @@
 //! reading a `.bsn` off disk, and the spawn pass, which also serves in-memory
 //! text through `JackdawScene::new`.
 
+mod util;
+
 use bevy::asset::{AssetPlugin, LoadState};
 use bevy::prelude::*;
 use jackdaw_runtime::{
-    JackdawCatalogPath, JackdawPlugin, JackdawScene, JackdawSceneRoot, SceneRefused,
+    JackdawPlugin, JackdawScene, JackdawSceneRoot, SceneRefused,
 };
 
 const RETIRED: &str = r#"
@@ -288,28 +290,27 @@ fn a_scene_inheriting_retired_ui_components_is_refused() {
         "#Panel\njackdaw_ui::UiCanvas\nbevy_transform::components::transform::Transform\n",
     )
     .expect("write the prefab");
+    std::fs::write(
+        dir.path().join("scene.bsn"),
+        "jackdaw::prefab::components::IsA { source: \"panel.bsn\", deleted: [] }\n\
+         jackdaw::prefab::components::PrefabEntityId(0)\n",
+    )
+    .expect("write the scene");
 
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.add_plugins(bevy::transform::TransformPlugin);
-    app.add_plugins(AssetPlugin::default());
+    app.add_plugins(AssetPlugin {
+        file_path: dir.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    });
     app.add_plugins(bevy::world_serialization::WorldSerializationPlugin);
-    app.insert_resource(JackdawCatalogPath(dir.path().join("catalog.bsn")));
     app.add_plugins(JackdawPlugin);
 
-    let scene = app
-        .world_mut()
-        .resource_mut::<Assets<JackdawScene>>()
-        .add(JackdawScene::new(
-            "jackdaw::prefab::components::IsA { source: \"panel.bsn\", deleted: [] }\n\
-             jackdaw::prefab::components::PrefabEntityId(0)\n"
-                .into(),
-            std::path::PathBuf::new(),
-        ));
+    let scene: Handle<JackdawScene> = app.world().resource::<AssetServer>().load("scene.bsn");
     let root = app.world_mut().spawn(JackdawSceneRoot(scene)).id();
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     let mut names = app.world_mut().query::<&Name>();
     let spawned: Vec<String> = names

@@ -7,7 +7,10 @@
 
 use bevy::prelude::*;
 use bevy::reflect::PartialReflect;
-use jackdaw_bsn::{BsnAssetContext, BsnField, BsnStructData, BsnStructFields, BsnValue};
+use jackdaw_bsn::{
+    BsnApplyAssets, BsnAssetContext, BsnField, BsnStructData, BsnStructFields, BsnValue,
+    server_loads,
+};
 use jackdaw_schema::{FieldSchema, TypeKind, TypeSchema};
 use serde_json::Value;
 
@@ -478,10 +481,10 @@ fn native_json_for_bsn(world: &World, type_path: &str, value: &BsnValue) -> Opti
         };
     }
     let server = world.get_resource::<AssetServer>();
-    let assets = server.map(|server| jackdaw_bsn::BsnApplyAssets {
-        server,
-        local: None,
-    });
+    let loads = server.map(server_loads);
+    let assets = loads
+        .as_ref()
+        .map(|load| BsnApplyAssets { load, local: None });
     let reflected = jackdaw_bsn::bsn_value_to_reflect(value, type_id, &registry, assets.as_ref())?;
     crate::inspector::reflect_fields::reflect_to_json(reflected.as_ref(), &registry)
 }

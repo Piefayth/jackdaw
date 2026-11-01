@@ -9,7 +9,7 @@ use jackdaw_bsn::BsnProjectAssets;
 use jackdaw_scene_types::{InstanceMaterialOverrides, MaterialOverrides};
 use jackdaw_surface::WornMaterial;
 
-use crate::JackdawCatalog;
+use crate::{DocumentAsset, JackdawDocuments, JackdawScene};
 
 /// Dresses the parts under every [`MaterialOverrides`] and [`InstanceMaterialOverrides`] by glTF material name.
 pub struct MaterialOverridesPlugin;
@@ -40,13 +40,13 @@ fn find_models_to_dress(
     mut removed: RemovedComponents<MaterialOverrides>,
     mut removed_instance: RemovedComponents<InstanceMaterialOverrides>,
     project: Option<Res<BsnProjectAssets>>,
-    catalog: Option<Res<JackdawCatalog>>,
+    documents: Option<Res<Assets<JackdawScene>>>,
 ) {
     let mut subtrees: HashSet<Entity> = changed.iter().collect();
     subtrees.extend(removed.read());
     subtrees.extend(removed_instance.read());
     let references_changed = project.is_some_and(|project| project.is_changed())
-        || catalog.is_some_and(|catalog| catalog.is_changed());
+        || documents.is_some_and(|documents| documents.is_changed());
     if references_changed {
         subtrees.extend(overridden.iter());
     }
@@ -65,15 +65,27 @@ fn find_models_to_dress(
 }
 
 /// The material a reference names, through the editor's project references or the game's catalog.
-pub fn material_of_reference(world: &World, reference: &str) -> Option<WornMaterial> {
-    let handle = world
+pub fn material_of_reference(world: &mut World, reference: &str) -> Option<WornMaterial> {
+    if let Some(handle) = world
         .get_resource::<BsnProjectAssets>()
         .and_then(|project| project.0.get(reference).cloned())
-        .or_else(|| {
-            world
-                .get_resource::<JackdawCatalog>()
-                .and_then(|catalog| catalog.get(reference).cloned())
-        })?;
+    {
+        return WornMaterial::of_handle(handle);
+    }
+
+    if !world.contains_resource::<JackdawDocuments>() {
+        return None;
+    }
+    let handle = world.resource_scope(|world, mut documents: Mut<JackdawDocuments>| {
+        match documents.asset(
+            world.resource::<AssetServer>(),
+            world.resource::<Assets<JackdawScene>>(),
+            reference,
+        ) {
+            DocumentAsset::Held(handle) => Some(handle),
+            DocumentAsset::Loading | DocumentAsset::Missing => None,
+        }
+    })?;
     WornMaterial::of_handle(handle)
 }
 

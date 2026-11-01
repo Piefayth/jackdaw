@@ -2,17 +2,18 @@
 //! beside the scene that wrote it, and a source game code inserts later is read
 //! the same way.
 
+mod util;
+
 use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy::world_serialization::WorldAssetRoot;
-use jackdaw_runtime::{JackdawCatalogPath, JackdawPlugin, JackdawScene, JackdawSceneRoot};
+use jackdaw_runtime::{JackdawPlugin, JackdawScene, JackdawSceneRoot};
 use jackdaw_scene_types::GltfSource;
 
 #[test]
 fn a_prefab_in_a_subdirectory_loads_its_gltf_from_the_assets_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = runtime_app(dir.path());
+    let mut app = runtime_app();
 
     let scene = app
         .world_mut()
@@ -25,7 +26,7 @@ fn a_prefab_in_a_subdirectory_loads_its_gltf_from_the_assets_root() {
         ));
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    settle_models(&mut app);
+    util::settle_models(&mut app);
 
     assert_eq!(
         loaded_gltf_path(app.world_mut()).as_deref(),
@@ -36,15 +37,14 @@ fn a_prefab_in_a_subdirectory_loads_its_gltf_from_the_assets_root() {
 
 #[test]
 fn a_gltf_source_inserted_at_runtime_spawns_its_model() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = runtime_app(dir.path());
+    let mut app = runtime_app();
 
     app.world_mut().spawn(GltfSource {
         path: "characters/fox.gltf".to_owned(),
         scene_index: 2,
     });
 
-    settle_models(&mut app);
+    util::settle_models(&mut app);
 
     assert_eq!(
         loaded_gltf_path(app.world_mut()).as_deref(),
@@ -61,36 +61,13 @@ fn loaded_gltf_path(world: &mut World) -> Option<String> {
     Some(root.0.path()?.to_string())
 }
 
-fn runtime_app(assets_root: &std::path::Path) -> App {
+fn runtime_app() -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.add_plugins(bevy::transform::TransformPlugin);
     app.add_plugins(AssetPlugin::default());
     app.add_plugins(bevy::world_serialization::WorldSerializationPlugin);
-    app.insert_resource(JackdawCatalogPath(assets_root.join("catalog.bsn")));
     app.add_plugins(JackdawPlugin);
     app
 }
 
-/// Run `app` until every placed model's import settings are read and the
-/// models waiting on them are placed.
-fn settle_models(app: &mut App) {
-    for _ in 0..200 {
-        app.update();
-        let reading = app
-            .world()
-            .resource::<jackdaw_scene_types::model_import::ModelLodIndex>()
-            .is_reading();
-        let waiting = app
-            .world_mut()
-            .query_filtered::<(), With<jackdaw_runtime::AwaitingModelSettings>>()
-            .iter(app.world())
-            .next()
-            .is_some();
-        if !reading && !waiting {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    app.update();
-}

@@ -18,10 +18,11 @@
 //! world, would make this unnecessary.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::camera::visibility::{RenderLayers, VisibilityRange, VisibilitySystems};
 use bevy::gltf::{GltfAssetLabel, GltfMaterialName};
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::world_serialization::{

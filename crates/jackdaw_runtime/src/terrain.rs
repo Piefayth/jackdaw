@@ -3,8 +3,9 @@
 //! A scene's `Terrain` entities carry a scene-relative `data_path` naming a
 //! `.jdterrain` sidecar beside the scene file. The sidecar decoder, splat
 //! material and clipmap mesher all live in `jackdaw_terrain`, shared with the
-//! editor. This module locates the sidecar, resolves the terrain's material
-//! names against the project catalog, and follows the game's camera.
+//! editor. The scene loader reads each sidecar through the asset server; this
+//! module hands the decoded data to its terrain, resolves the terrain's
+//! material files, and follows the game's camera.
 //!
 //! The decoded heights are published on each terrain as [`TerrainHeights`],
 //! for code that needs the ground's shape, such as a physics collider.
@@ -13,12 +14,16 @@
 //! building ground from partial data. A missing sidecar is the flat-ground
 //! case and is not an error.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use bevy::asset::LoadState;
+use bevy::asset::io::AssetReaderError;
+use bevy::asset::{LoadContext, LoadState, ReadAssetBytesError};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use jackdaw_bsn::{BsnPatch, BsnValue, SceneBsnAst, document_text_from_bytes};
+use jackdaw_prefab::prefab_model;
 use jackdaw_scene_types::Terrain;
 use jackdaw_terrain::render::{
     DetailDirty, DetailRenderPlugin, DetailSystems, LayerImages, LayerTexels, ScatterDirty,
@@ -30,9 +35,12 @@ use jackdaw_terrain::render::{
 use jackdaw_terrain::sidecar::{self, TerrainMaterialSlot};
 use jackdaw_terrain::splat::ControlTexels;
 use jackdaw_terrain::texture_set::TextureSet;
-use jackdaw_terrain::{ClipmapLevel, Heightmap, RegionTerrainData};
+use jackdaw_terrain::{ClipmapLevel, Heightmap, RegionTerrainData, is_prefab_asset};
 
-use crate::JackdawCatalog;
+use crate::{
+    DocumentAsset, JackdawDocuments, JackdawScene, asset_root_source, parse_prefab,
+    spawn_loaded_scenes,
+};
 
 /// Colour of a terrain drawn without a texture set.
 ///
@@ -53,54 +61,32 @@ pub(crate) fn plugin(app: &mut App) {
                 resolve_material_slots,
                 build_ready_materials,
                 sync_surfaces,
-                resolve_scatter_prefabs,
             )
                 .chain()
-                .after(crate::spawn_loaded_scenes)
+                .after(spawn_loaded_scenes)
                 .before(ScatterSystems::Rebuild)
                 .before(DetailSystems::Rebuild),
         );
     app.add_systems(Update, publish_heights.after(refresh_heightmaps));
 }
 
-/// Answer the prefabs stored scatter names with the models they draw, read
-/// from the game's assets.
-fn resolve_scatter_prefabs(
-    mut prefabs: ResMut<ScatterPrefabs>,
-    catalog_path: Option<Res<crate::JackdawCatalogPath>>,
-    asset_folder: Option<Res<crate::AssetFolder>>,
-) {
-    let wanted: Vec<String> = prefabs.wanted().map(str::to_string).collect();
-    if wanted.is_empty() {
-        return;
-    }
-    let Some(assets) = crate::resolve_assets_root(catalog_path.as_deref(), asset_folder.as_deref())
-    else {
-        return;
-    };
-    for name in wanted {
-        let path = assets.join(&name);
-        let file = jackdaw_bsn::existing_form(&path).unwrap_or(path);
-        let model = match jackdaw_prefab::read_prefab_document(&file, &assets) {
-            Ok(document) => jackdaw_prefab::prefab_model(&document),
-            Err(err) => {
-                warn!("terrain scatter: cannot read the prefab {name}: {err}");
-                None
-            }
-        };
-        let model = model.map(|model| ScatterPrefab {
-            model: model.source,
-            local: Transform::from_matrix(Mat4::from(model.local)),
-            materials: model.materials,
-        });
-        prefabs.resolve(&name, model);
-    }
+/// storage for the "sidecar" terrain data
+#[derive(Clone, Default)]
+pub(crate) struct TerrainFiles {
+    files: HashMap<String, TerrainFile>,
+    scatter_prefabs: Vec<(String, Option<ScatterPrefab>)>,
+}
+
+#[derive(Clone)]
+enum TerrainFile {
+    Data(Arc<RegionTerrainData>),
+    Unreadable(String),
 }
 
 /// The sidecar file one terrain draws, resolved beneath the directory of the
 /// scene that spawned it.
 #[derive(Component)]
-struct TerrainSidecar(PathBuf);
+struct TerrainSidecar(TerrainFile);
 
 /// A terrain's decoded document, plus the heights the mesher samples.
 ///
@@ -177,38 +163,132 @@ struct BuiltLevel(ClipmapLevel);
 #[derive(Resource)]
 struct UntexturedTerrain(Handle<StandardMaterial>);
 
-/// Record the sidecar each freshly spawned terrain draws.
-///
-/// Called from the scene spawn, the only place the scene's directory is known:
-/// `data_path` is relative to it and the entity keeps no other trace of where
-/// it came from. A path that names nothing loadable is logged and the terrain
-/// draws flat.
-pub(crate) fn attach_sidecars(world: &mut World, spawned: &[Entity], parent_path: &Path) {
-    let terrains: Vec<(Entity, String)> = spawned
-        .iter()
-        .filter_map(|&entity| {
-            world
-                .get::<Terrain>(entity)
-                .filter(|terrain| !terrain.data_path.is_empty())
-                .map(|terrain| (entity, terrain.data_path.clone()))
+/// fork - in the bsn, where are the terrains?
+pub(crate) fn terrain_data_paths(ast: &SceneBsnAst) -> Vec<String> {
+    let type_path = <Terrain as TypePath>::type_path();
+    let mut paths: Vec<String> = ast
+        .entities_with_component(type_path)
+        .into_iter()
+        .filter_map(|node| match ast.get_patch(ast.find_patch_by_type_path(node, type_path)?) {
+            Some(BsnPatch::Struct(data)) => {
+                data.fields.0.iter().find_map(|field| match &field.value {
+                    BsnValue::String(path)
+                        if field.name == "data_path" && !path.is_empty() =>
+                    {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
         })
         .collect();
-    if terrains.is_empty() {
-        return;
-    }
-    let Some(root) = crate::assets_root(world) else {
-        warn!("no asset root found; terrain sidecars cannot be located");
-        return;
-    };
+    paths.sort();
+    paths.dedup();
+    paths
+}
 
-    let scene_dir = root.join(parent_path);
-    for (entity, data_path) in terrains {
-        match sidecar::resolve_path(&scene_dir, &data_path) {
-            Ok(path) => {
-                world.entity_mut(entity).insert(TerrainSidecar(path));
+pub(crate) async fn read_terrain_files(
+    data_paths: Vec<String>,
+    scene_dir: &Path,
+    load_context: &mut LoadContext<'_>,
+) -> TerrainFiles {
+    let mut files = HashMap::new();
+    for data_path in data_paths {
+        let path = match sidecar::resolve_path(scene_dir, &data_path) {
+            Ok(path) => path,
+            Err(err) => {
+                warn!("terrain data path {data_path:?} is unusable: {err}");
+                continue;
             }
-            Err(err) => warn!("terrain data path {data_path:?} is unusable: {err}"),
+        };
+        let file = match load_context.read_asset_bytes(path.clone()).await {
+            Ok(bytes) => decode_terrain_file(&bytes, &path),
+            Err(ReadAssetBytesError::AssetReaderError(AssetReaderError::NotFound(_))) => continue,
+            Err(err) => TerrainFile::Unreadable(format!(
+                "terrain data {} could not be read ({err}); this terrain draws nothing",
+                path.display()
+            )),
+        };
+        files.insert(data_path, file);
+    }
+
+    let mut prefab_paths: Vec<String> = files
+        .values()
+        .filter_map(|file| match file {
+            TerrainFile::Data(data) => Some(data),
+            TerrainFile::Unreadable(_) => None,
+        })
+        .flat_map(|data| &data.scatter.assets)
+        .filter(|entry| !entry.is_tombstone() && is_prefab_asset(&entry.asset))
+        .map(|entry| entry.asset.clone())
+        .collect();
+    prefab_paths.sort();
+    prefab_paths.dedup();
+    let mut scatter_prefabs = Vec::new();
+    for path in prefab_paths {
+        let document = match asset_root_source(Path::new(&path)) {
+            None => Err("it is outside the asset root".to_string()),
+            Some(source) => match load_context.read_asset_bytes(source.clone()).await {
+                Ok(bytes) => document_text_from_bytes(&bytes, &source)
+                    .map_err(|err| err.to_string())
+                    .and_then(|text| {
+                        parse_prefab(&source, &text).map_err(|err| err.to_string())
+                    }),
+                Err(err) => Err(err.to_string()),
+            },
+        };
+        let model = match document {
+            Ok(document) => prefab_model(&document),
+            Err(err) => {
+                warn!("terrain scatter: cannot read the prefab {path}: {err}");
+                None
+            }
+        };
+        let model = model.map(|model| ScatterPrefab {
+            model: model.source,
+            local: Transform::from_matrix(Mat4::from(model.local)),
+            materials: model.materials,
+        });
+        scatter_prefabs.push((path, model));
+    }
+    TerrainFiles {
+        files,
+        scatter_prefabs,
+    }
+}
+
+fn decode_terrain_file(bytes: &[u8], path: &Path) -> TerrainFile {
+    match sidecar::load_from(bytes, None) {
+        Ok(loaded) => {
+            for message in loaded.warnings() {
+                warn!("{message}");
+            }
+            TerrainFile::Data(Arc::new(loaded.data))
         }
+        Err(err) => TerrainFile::Unreadable(format!(
+            "terrain data {} is unreadable ({err}); this terrain draws nothing until the file \
+             is fixed",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn attach_sidecars(world: &mut World, spawned: &[Entity], files: &TerrainFiles) {
+    if let Some(mut prefabs) = world.get_resource_mut::<ScatterPrefabs>() {
+        for (path, model) in &files.scatter_prefabs {
+            prefabs.resolve(path, model.clone());
+        }
+    }
+    for &entity in spawned {
+        let Some(file) = world
+            .get::<Terrain>(entity)
+            .and_then(|terrain| files.files.get(&terrain.data_path))
+            .cloned()
+        else {
+            continue;
+        };
+        world.entity_mut(entity).insert(TerrainSidecar(file));
     }
 }
 
@@ -219,33 +299,15 @@ fn load_sidecars(
         (Entity, &Terrain, Option<&TerrainSidecar>),
         (Without<TerrainDocument>, Without<TerrainUnreadable>),
     >,
-    catalog_path: Option<Res<crate::JackdawCatalogPath>>,
-    asset_folder: Option<Res<crate::AssetFolder>>,
 ) {
-    let assets = crate::resolve_assets_root(catalog_path.as_deref(), asset_folder.as_deref());
-    for (entity, terrain, sidecar_path) in &terrains {
-        let data = match sidecar_path {
-            Some(TerrainSidecar(path)) => match std::fs::read(path) {
-                Ok(bytes) => match sidecar::load_from(&bytes, assets.as_deref()) {
-                    Ok(loaded) => {
-                        for message in loaded.warnings() {
-                            warn!("{message}");
-                        }
-                        loaded.data
-                    }
-                    Err(err) => {
-                        error!(
-                            "terrain data {} is unreadable ({err}); this terrain draws nothing \
-                             until the file is fixed",
-                            path.display()
-                        );
-                        commands.entity(entity).insert(TerrainUnreadable);
-                        continue;
-                    }
-                },
-                // A missing file is the flat-ground case, not a fault.
-                Err(_) => RegionTerrainData::default(),
-            },
+    for (entity, terrain, sidecar) in &terrains {
+        let data = match sidecar {
+            Some(TerrainSidecar(TerrainFile::Data(data))) => RegionTerrainData::clone(data),
+            Some(TerrainSidecar(TerrainFile::Unreadable(reason))) => {
+                error!("{reason}");
+                commands.entity(entity).insert(TerrainUnreadable);
+                continue;
+            }
             None => RegionTerrainData::default(),
         };
 
@@ -283,24 +345,6 @@ fn document_of(data: RegionTerrainData, terrain: &Terrain) -> TerrainDocument {
     }
 }
 
-/// The `StandardMaterial` a slot's reference addresses, through the project
-/// catalog that `materials/<name>.material.bsn` and `catalog.bsn` both feed.
-///
-/// A slot spells the path of its material file; the catalog is keyed by the
-/// name that path's file carries, so a path is looked up by its own last
-/// segment when nothing answers to the path itself.
-///
-/// [`resolve_with`] decides what a resolved material means: which of its slots
-/// is albedo, and that a vacated or unfound reference keeps its texture id.
-fn catalog_material(catalog: &JackdawCatalog, reference: &str) -> Option<Handle<StandardMaterial>> {
-    let name = jackdaw_bsn::asset_stem(reference);
-    catalog
-        .get(reference)
-        .or_else(|| catalog.get(&format!("@{name}")))
-        .cloned()
-        .and_then(|handle| handle.try_typed::<StandardMaterial>().ok())
-}
-
 /// Keep every terrain's resolved set following its material list.
 ///
 /// Runs every frame rather than on a change signal: resolution is one catalog
@@ -308,16 +352,29 @@ fn catalog_material(catalog: &JackdawCatalog, reference: &str) -> Option<Handle<
 /// unchanged terrain writes nothing, and a material file that finishes loading
 /// late is picked up on the next frame without invalidation bookkeeping.
 fn resolve_material_slots(
-    catalog: Res<JackdawCatalog>,
+    mut documents: ResMut<JackdawDocuments>,
+    scenes: Res<Assets<JackdawScene>>,
     standard: Res<Assets<StandardMaterial>>,
     assets: Res<AssetServer>,
     mut terrains: Query<(&TerrainDocument, &mut TerrainSplat)>,
 ) {
-    for (document, mut splat) in &mut terrains {
+    'terrains: for (document, mut splat) in &mut terrains {
         let slots = &document.data.materials;
+        let mut materials: HashMap<&str, Handle<StandardMaterial>> = HashMap::new();
+        for slot in slots.iter().filter(|slot| !slot.is_tombstone()) {
+            match documents.asset(&assets, &scenes, &slot.material) {
+                DocumentAsset::Loading => continue 'terrains,
+                DocumentAsset::Held(handle) => {
+                    if let Ok(handle) = handle.try_typed() {
+                        materials.insert(&slot.material, handle);
+                    }
+                }
+                DocumentAsset::Missing => {}
+            }
+        }
         let resolved = resolve_with(
             slots,
-            |name| catalog_material(&catalog, name).and_then(|handle| standard.get(&handle)),
+            |name| materials.get(name).and_then(|handle| standard.get(handle)),
             &assets,
         );
         if splat.slots == *slots && splat.set == resolved.set && splat.missing == resolved.missing {
@@ -708,6 +765,11 @@ mod tests {
     use bevy::asset::{AssetApp, AssetPlugin};
     use jackdaw_terrain::sidecar::{AutoTerrainSettings, RegionTerrainData};
 
+    use crate::{JackdawSceneLoader, ReflectBsnAsset};
+
+    const GRASS_PATH: &str = "materials/grass.material.bsn";
+    const NOWHERE_PATH: &str = "materials/nowhere.material.bsn";
+
     const GRASS: &str = "#grass\nbevy_pbr::pbr_material::StandardMaterial {\n    \
         base_color_texture: \"textures/grass_basecolor.png\",\n    \
         normal_map_texture: \"textures/grass_normal.png\",\n    \
@@ -720,7 +782,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let assets = tmp.path().join("assets");
         std::fs::create_dir_all(assets.join("materials")).expect("materials dir");
-        std::fs::write(assets.join("catalog.bsn"), "// no catalog entries\n").expect("catalog");
         std::fs::write(assets.join("materials/grass.material.bsn"), GRASS).expect("material");
 
         let mut data = RegionTerrainData {
@@ -730,9 +791,9 @@ mod tests {
                 jackdaw_terrain::RegionSize::new(4).expect("a power of two"),
             ),
             materials: vec![
-                TerrainMaterialSlot::new("grass"),
+                TerrainMaterialSlot::new(GRASS_PATH),
                 TerrainMaterialSlot::tombstone(),
-                TerrainMaterialSlot::new("nowhere"),
+                TerrainMaterialSlot::new(NOWHERE_PATH),
             ],
             autoterrain: AutoTerrainSettings {
                 enabled: true,
@@ -752,7 +813,8 @@ mod tests {
         tmp
     }
 
-    fn catalog_app(assets_root: &Path) -> App {
+    /// An app that loads material files the way a game does.
+    fn documents_app(assets_root: &Path) -> App {
         let mut app = App::new();
         app.add_plugins((
             bevy::app::TaskPoolPlugin::default(),
@@ -765,22 +827,48 @@ mod tests {
         app.init_asset::<StandardMaterial>();
         app.register_asset_reflect::<Image>();
         app.register_asset_reflect::<StandardMaterial>();
-        app.init_resource::<JackdawCatalog>();
-        crate::load_walked_assets(app.world_mut(), assets_root, None);
+        app.register_type_data::<StandardMaterial, ReflectBsnAsset>();
+        app.init_asset::<JackdawScene>()
+            .init_asset_loader::<JackdawSceneLoader>()
+            .init_resource::<JackdawDocuments>();
         app
     }
 
     /// Resolution through the catalog, the way `resolve_material_slots` does
     /// it. The mapping itself lives in the shared crate and is tested there.
     fn resolve_in(
-        app: &App,
+        app: &mut App,
         slots: &[TerrainMaterialSlot],
     ) -> jackdaw_terrain::render::ResolvedSlots {
-        let catalog = app.world().resource::<JackdawCatalog>();
+        let mut materials: HashMap<String, Handle<StandardMaterial>> = HashMap::new();
+        for slot in slots.iter().filter(|slot| !slot.is_tombstone()) {
+            for _ in 0..400 {
+                app.update();
+                let answer = app.world_mut().resource_scope(
+                    |world, mut documents: Mut<JackdawDocuments>| {
+                        documents.asset(
+                            world.resource::<AssetServer>(),
+                            world.resource::<Assets<JackdawScene>>(),
+                            &slot.material,
+                        )
+                    },
+                );
+                match answer {
+                    DocumentAsset::Loading => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    DocumentAsset::Held(handle) => {
+                        materials.insert(slot.material.clone(), handle.typed());
+                        break;
+                    }
+                    DocumentAsset::Missing => break,
+                }
+            }
+        }
         let standard = app.world().resource::<Assets<StandardMaterial>>();
         resolve_with(
             slots,
-            |name| catalog_material(catalog, name).and_then(|handle| standard.get(&handle)),
+            |name| materials.get(name).and_then(|handle| standard.get(handle)),
             app.world().resource::<AssetServer>(),
         )
     }
@@ -820,15 +908,17 @@ mod tests {
         app.add_systems(Update, load_sidecars);
         let entity = app
             .world_mut()
-            .spawn((
-                Terrain {
-                    resolution: 4,
-                    data_path: "zone.terrain-0.jdterrain".to_string(),
-                    ..default()
-                },
-                TerrainSidecar(path.to_owned()),
-            ))
+            .spawn(Terrain {
+                resolution: 4,
+                data_path: "zone.terrain-0.jdterrain".to_string(),
+                ..default()
+            })
             .id();
+        if let Ok(bytes) = std::fs::read(path) {
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(TerrainSidecar(decode_terrain_file(&bytes, path)));
+        }
         app.update();
         (app, entity)
     }
@@ -983,14 +1073,14 @@ mod tests {
     /// A saved material's three texture slots become the entry's albedo,
     /// normal and height.
     #[test]
-    fn a_slot_resolves_through_the_catalog_to_its_materials_textures() {
+    fn a_slot_resolves_through_its_material_file_to_the_files_textures() {
         let project = fixture_project();
-        let app = catalog_app(&project.path().join("assets"));
+        let mut app = documents_app(&project.path().join("assets"));
 
-        let resolved = resolve_in(&app, &[TerrainMaterialSlot::new("grass")]);
+        let resolved = resolve_in(&mut app, &[TerrainMaterialSlot::new(GRASS_PATH)]);
 
         let entry = &resolved.set.entries[0];
-        assert_eq!(entry.material, "grass");
+        assert_eq!(entry.material, GRASS_PATH);
         assert_eq!(
             entry.albedo.as_deref(),
             Some("textures/grass_basecolor.png")
@@ -1004,34 +1094,34 @@ mod tests {
     }
 
     #[test]
-    fn a_name_the_catalog_does_not_hold_is_reported_missing() {
+    fn a_material_file_that_is_not_there_is_reported_missing() {
         let project = fixture_project();
-        let app = catalog_app(&project.path().join("assets"));
+        let mut app = documents_app(&project.path().join("assets"));
 
-        let resolved = resolve_in(&app, &[TerrainMaterialSlot::new("nowhere")]);
+        let resolved = resolve_in(&mut app, &[TerrainMaterialSlot::new(NOWHERE_PATH)]);
 
-        assert_eq!(resolved.missing, vec!["nowhere".to_string()]);
+        assert_eq!(resolved.missing, vec![NOWHERE_PATH.to_string()]);
         assert!(resolved.set.entries[0].albedo.is_none());
     }
 
     /// The whole chain, from the file on disk to the entries the array
     /// builder is handed.
     #[test]
-    fn a_sidecars_material_list_resolves_against_the_project_catalog() {
+    fn a_sidecars_material_list_resolves_through_its_material_files() {
         let project = fixture_project();
         let assets = project.path().join("assets");
-        let app = catalog_app(&assets);
+        let mut app = documents_app(&assets);
         let path = sidecar::resolve_path(&assets, "zone.terrain-0.jdterrain").expect("resolve");
         let data = sidecar::load(&std::fs::read(&path).expect("read")).expect("decode");
 
-        let resolved = resolve_in(&app, &data.materials);
+        let resolved = resolve_in(&mut app, &data.materials);
 
         assert_eq!(resolved.set.entries.len(), 3);
         assert_eq!(
             resolved.set.entries[0].albedo.as_deref(),
             Some("textures/grass_basecolor.png")
         );
-        assert_eq!(resolved.missing, vec!["nowhere".to_string()]);
+        assert_eq!(resolved.missing, vec![NOWHERE_PATH.to_string()]);
     }
 
     /// One terrain, its levels laid out around a camera the test moves.

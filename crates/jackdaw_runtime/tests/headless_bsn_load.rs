@@ -1,6 +1,8 @@
 //! Headless load of a `.bsn` scene through the runtime asset loader: the
 //! text goes through the worldless bridge and the normal spawn loop.
 
+mod util;
+
 use bevy::prelude::*;
 use jackdaw_runtime::{JackdawPlugin, JackdawScene, JackdawSceneRoot};
 
@@ -36,21 +38,13 @@ bevy_ecs::hierarchy::Children [
     let handle: Handle<JackdawScene> = app.world().resource::<AssetServer>().load("scene.bsn");
     app.world_mut().spawn(JackdawSceneRoot(handle));
 
-    // Pump updates until the async loader delivers and the spawn loop runs.
-    let mut found = None;
-    for _ in 0..200 {
-        app.update();
+    let translation = util::wait_for(&mut app, "the Anchor entity to load", |app| {
         let mut query = app.world_mut().query::<(&Name, &Transform)>();
-        if let Some((_, t)) = query
+        query
             .iter(app.world())
             .find(|(n, _)| n.as_str() == "Anchor")
-        {
-            found = Some(t.translation);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    let translation = found.expect("Anchor entity loaded from .bsn");
+            .map(|(_, t)| t.translation)
+    });
     assert!((translation - Vec3::new(4.0, 5.0, 6.0)).length() < 1e-5);
 
     // The stable node id component survives (the PIE mapping depends on it).
@@ -105,13 +99,9 @@ bevy_ecs::hierarchy::Children [
             .find(|(name, _)| name.as_str() == wanted)
             .map(|(_, visibility)| visibility.copied())
     };
-    for _ in 0..200 {
-        app.update();
-        if visibility(&mut app, "Kid").is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    util::wait_until(&mut app, "the Kid entity to load", |app| {
+        visibility(app, "Kid").is_some()
+    });
     assert_eq!(
         visibility(&mut app, "Parent"),
         Some(Some(Visibility::Inherited))

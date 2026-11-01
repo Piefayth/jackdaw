@@ -37,9 +37,10 @@ render = [
     "bevy/bevy_asset",
     "bevy/bevy_gltf",
     "bevy/gltf_animation",
-    "dep:meshopt",
     "jackdaw_geometry/render",
 ]
+# disable lods so web works
+import = ["render", "dep:meshopt"]
 
 [lints]
 workspace = true

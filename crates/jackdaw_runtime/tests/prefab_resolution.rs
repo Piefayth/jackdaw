@@ -2,11 +2,13 @@
 //! loads it, the same way the editor resolves it on open: the instance root
 //! carries the inherited components and the referenced tree spawns beneath it.
 
-use std::path::PathBuf;
+mod util;
+
+use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
 use jackdaw_runtime::{
-    JackdawCatalogPath, JackdawPlugin, JackdawScene, JackdawSceneMember, JackdawSceneRoot,
+    JackdawAssetSourcePlugin, JackdawPlugin, JackdawScene, JackdawSceneMember, JackdawSceneRoot,
 };
 use jackdaw_scene_types::UiSceneRoot;
 
@@ -36,8 +38,7 @@ fn a_world_scene_resolves_the_prefab_it_references() {
     );
     let scene_root = app.world_mut().spawn(JackdawSceneRoot(scene)).id();
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     let panel = named_entity(app.world_mut(), "Panel").expect("the prefab root materialized");
     assert!(
@@ -78,8 +79,7 @@ fn an_authored_override_wins_over_the_inherited_value() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     let label = named_entity(app.world_mut(), "Label").expect("the inherited child spawned");
     assert_eq!(
@@ -126,8 +126,7 @@ fn a_cyclic_reference_is_refused_rather_than_followed() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     // Fail-soft: the refusal costs the inherited content, not the scene.
     assert!(
@@ -177,8 +176,7 @@ fn a_reference_deeper_than_the_cap_is_refused() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     assert!(
         named_entity(app.world_mut(), "Instance").is_some(),
@@ -203,8 +201,7 @@ fn a_prefab_held_only_in_the_binary_form_still_resolves() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     assert!(
         named_entity(app.world_mut(), "Panel").is_some(),
@@ -216,24 +213,38 @@ fn a_prefab_held_only_in_the_binary_form_still_resolves() {
     );
 }
 
+/// The folder a test's assets are written to and read from.
+#[derive(Resource)]
+struct AssetRoot(PathBuf);
+
+/// Write `bsn` as the scene file and load it, as a game loads its scenes.
 fn add_scene(app: &mut App, bsn: &str) -> Handle<JackdawScene> {
-    app.world_mut()
-        .resource_mut::<Assets<JackdawScene>>()
-        .add(JackdawScene::new(bsn.to_owned(), PathBuf::new()))
+    let root = &app.world().resource::<AssetRoot>().0;
+    std::fs::write(root.join("scene.bsn"), bsn).unwrap();
+    app.world().resource::<AssetServer>().load("scene.bsn")
 }
 
-fn runtime_app(assets_root: &std::path::Path) -> App {
+fn runtime_app(assets_root: &Path) -> App {
     let mut app = App::new();
+    let file_path = assets_root.to_string_lossy().into_owned();
     app.add_plugins(MinimalPlugins);
     app.add_plugins(bevy::transform::TransformPlugin);
-    app.add_plugins(AssetPlugin::default());
+    // An exported prefab is held as its binary twin, which the reference still
+    // spells as text.
+    app.add_plugins(JackdawAssetSourcePlugin {
+        file_path: file_path.clone(),
+        ..Default::default()
+    });
+    app.add_plugins(AssetPlugin {
+        file_path,
+        ..Default::default()
+    });
     app.add_plugins(bevy::world_serialization::WorldSerializationPlugin);
-    // The runtime reads prefab sources from the asset root, which the catalog
-    // names.
-    app.insert_resource(JackdawCatalogPath(assets_root.join("catalog.bsn")));
     app.add_plugins(JackdawPlugin);
+    app.insert_resource(AssetRoot(assets_root.to_path_buf()));
     app
 }
+
 
 fn named_entity(world: &mut World, target: &str) -> Option<Entity> {
     let mut names = world.query::<(Entity, &Name)>();
@@ -264,8 +275,7 @@ fn a_source_outside_the_asset_root_is_refused() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     assert!(
         named_entity(app.world_mut(), "Instance").is_some(),
@@ -307,8 +317,7 @@ fn a_source_reached_through_another_prefab_is_refused_outside_the_asset_root() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     assert!(
         named_entity(app.world_mut(), "Instance").is_some(),
@@ -325,7 +334,7 @@ fn a_source_reached_through_another_prefab_is_refused_outside_the_asset_root() {
 }
 
 /// A variant inherits from the base it was cut from, so resolving one is two
-/// levels of reference, the inner spelled relative to the variant file.
+/// levels of reference, each spelled under the asset root.
 #[test]
 fn a_variant_resolves_through_the_base_it_was_cut_from() {
     let dir = tempfile::tempdir().unwrap();
@@ -337,7 +346,7 @@ fn a_variant_resolves_through_the_base_it_was_cut_from() {
         "#Variant\n\
          jackdaw::prefab::components::Prefab\n\
          jackdaw::prefab::components::PrefabEntityId(0)\n\
-         jackdaw::prefab::components::IsA { source: \"../base/panel.bsn\", deleted: [] }\n",
+         jackdaw::prefab::components::IsA { source: \"base/panel.bsn\", deleted: [] }\n",
     )
     .unwrap();
 
@@ -349,8 +358,7 @@ fn a_variant_resolves_through_the_base_it_was_cut_from() {
     );
     app.world_mut().spawn(JackdawSceneRoot(scene));
 
-    app.update();
-    app.update();
+    util::settle_scenes(&mut app);
 
     let variant = named_entity(app.world_mut(), "Variant").expect("the variant root materialized");
     assert!(

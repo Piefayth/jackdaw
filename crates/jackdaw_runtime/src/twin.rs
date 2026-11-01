@@ -55,7 +55,7 @@ impl Plugin for JackdawAssetSourcePlugin {
             .then_some(self.processed_file_path.as_str());
         let source = AssetSourceBuilder::platform_default(&self.file_path, processed);
         let source = with_document_twins(source);
-        #[cfg(feature = "render")]
+        #[cfg(feature = "import")]
         let source = if matches!(self.mode, AssetMode::Unprocessed) {
             crate::texture_import::with_texture_imports(source, texture_cache(&self.file_path))
         } else {
@@ -68,7 +68,7 @@ impl Plugin for JackdawAssetSourcePlugin {
 
 /// Where textures an unprocessed game imports on load are kept: `.jackdaw/imported`
 /// beside the asset folder, the same place the editor keeps them.
-#[cfg(feature = "render")]
+#[cfg(feature = "import")]
 fn texture_cache(file_path: &str) -> PathBuf {
     let assets = bevy::asset::io::file::FileAssetReader::get_base_path().join(file_path);
     assets

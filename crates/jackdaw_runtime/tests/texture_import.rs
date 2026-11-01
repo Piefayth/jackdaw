@@ -4,6 +4,8 @@
 
 #![cfg(feature = "render")]
 
+mod util;
+
 use std::path::{Path, PathBuf};
 
 use bevy::asset::io::file::FileAssetReader;
@@ -54,11 +56,7 @@ fn reader_app(dir: &Path, cache: PathBuf) -> App {
 
 fn load_image(app: &mut App, path: &str) -> Image {
     let handle: Handle<Image> = app.world().resource::<AssetServer>().load(path.to_string());
-    for _ in 0..2000 {
-        app.update();
-        if let Some(image) = app.world().resource::<Assets<Image>>().get(&handle) {
-            return image.clone();
-        }
+    util::wait_for(app, path, |app| {
         if let Some(LoadState::Failed(err)) = app
             .world()
             .resource::<AssetServer>()
@@ -66,9 +64,8 @@ fn load_image(app: &mut App, path: &str) -> Image {
         {
             panic!("{path} failed to load: {err}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("{path} never loaded");
+        app.world().resource::<Assets<Image>>().get(&handle).cloned()
+    })
 }
 
 fn files_under(dir: &Path) -> usize {

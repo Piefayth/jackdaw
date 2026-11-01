@@ -6,7 +6,7 @@
 
 use std::any::TypeId;
 
-use bevy::asset::{AssetServer, ReflectHandle};
+use bevy::asset::{AssetServer, ReflectHandle, UntypedHandle};
 use bevy::ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
@@ -20,7 +20,7 @@ use bevy::reflect::{
 
 use crate::{
     AstNodeRef, BsnField, BsnPatch, BsnStructData, BsnStructFields, BsnTupleStructData, BsnValue,
-    SceneBsnAst,
+    SceneBsnAst, is_document_path,
 };
 
 /// Marker component: the entity's AST patches have changed and need to be
@@ -28,12 +28,28 @@ use crate::{
 #[derive(Component)]
 pub struct AstDirty;
 
-/// Assets available while applying document values: a map of the references
-/// already loaded, consulted first for any string a handle field spells, and
-/// the asset server for everything else.
+/// fork - map of string references to the asset handles being loaded
 pub struct BsnApplyAssets<'a> {
-    pub server: &'a AssetServer,
+    // load is async
+    pub load: &'a dyn Fn(TypeId, &str) -> UntypedHandle,
     pub local: Option<&'a bevy::platform::collections::HashMap<String, bevy::asset::UntypedHandle>>,
+}
+
+/// fork - a "load" where your caller actually has an asset server
+pub fn server_loads(server: &AssetServer) -> impl Fn(TypeId, &str) -> UntypedHandle {
+    |type_id, path| server.load_builder().load_erased(type_id, path.to_owned())
+}
+
+/// fork - the label (#Asset) through which we expose the underlying asset
+pub const DOCUMENT_ASSET_LABEL: &str = "Asset";
+
+/// fork - if its .bsn, we want the labeled path to the #Asset
+pub fn asset_path_of_reference(reference: &str) -> std::borrow::Cow<'_, str> {
+    if is_document_path(std::path::Path::new(reference)) {
+        format!("{reference}#{DOCUMENT_ASSET_LABEL}").into()
+    } else {
+        reference.into()
+    }
 }
 
 /// The references the open scene resolves: the paths of the project's asset
@@ -501,8 +517,9 @@ fn apply_struct_patch(world: &mut World, entity: Entity, data: &BsnStructData) {
     let local = world
         .get_resource::<BsnSceneAssets>()
         .map(|assets| assets.0.clone());
-    let assets_ctx = server.as_ref().map(|s| BsnApplyAssets {
-        server: s,
+    let loads = server.as_ref().map(server_loads);
+    let assets_ctx = loads.as_ref().map(|load| BsnApplyAssets {
+        load,
         local: local.as_ref(),
     });
     let registry = world.resource::<AppTypeRegistry>().clone();
@@ -778,8 +795,9 @@ fn apply_tuple_struct_patch(world: &mut World, entity: Entity, data: &BsnTupleSt
     let local = world
         .get_resource::<BsnSceneAssets>()
         .map(|assets| assets.0.clone());
-    let assets_ctx = server.as_ref().map(|s| BsnApplyAssets {
-        server: s,
+    let loads = server.as_ref().map(server_loads);
+    let assets_ctx = loads.as_ref().map(|load| BsnApplyAssets {
+        load,
         local: local.as_ref(),
     });
     let registry = world.resource::<AppTypeRegistry>().clone();
@@ -994,17 +1012,16 @@ pub fn bsn_value_to_reflect(
                 let typed = reflect_handle.typed(handle.clone());
                 return Some(typed.into_partial_reflect());
             }
-            if path.starts_with('#') || path.starts_with('@') {
+            if path.starts_with('#') {
                 log::warn!(
-                    "asset reference '{path}' did not resolve in the project catalog or \
-                     embedded assets; using the default handle"
+                    "asset reference '{path}' names no asset the document embeds; \
+                     using the default handle"
                 );
             } else {
-                let asset_type_id = reflect_handle.asset_type_id();
-                let untyped = assets
-                    .server
-                    .load_builder()
-                    .load_erased(asset_type_id, path.to_owned());
+                let untyped = (assets.load)(
+                    reflect_handle.asset_type_id(),
+                    &asset_path_of_reference(path),
+                );
                 let typed = reflect_handle.typed(untyped);
                 return Some(typed.into_partial_reflect());
             }

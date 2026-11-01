@@ -1,13 +1,18 @@
-//! The startup walk reads a document in either form, and keys a binary one by
-//! the path its text twin would sit at, so references written before an export
-//! still resolve.
+//! A document exported to the binary form still answers to the text path a
+//! reference spells, through the twin-resolving asset source, so references
+//! written before an export still resolve.
+
+mod util;
 
 use std::path::PathBuf;
 
-use bevy::asset::{Asset, AssetApp};
+use bevy::asset::{Asset, AssetApp, AssetPlugin};
+use bevy::image::ImagePlugin;
+use bevy::transform::TransformPlugin;
+use bevy::world_serialization::WorldSerializationPlugin;
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
-use jackdaw_runtime::{JackdawCatalog, JackdawCatalogPath, JackdawPlugin};
+use jackdaw_runtime::{JackdawAssetSourcePlugin, JackdawPlugin, ReflectBsnAsset};
 
 /// A reflectable stand-in for a material, so the walk has a registered asset
 /// type to load without the render stack.
@@ -28,72 +33,49 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     ))
 }
 
-fn app_over(dir: &std::path::Path) -> App {
-    let mut app = App::new();
-    app.add_plugins(MinimalPlugins);
-    app.add_plugins(bevy::transform::TransformPlugin);
-    app.add_plugins(bevy::asset::AssetPlugin::default());
-    app.add_plugins(bevy::world_serialization::WorldSerializationPlugin);
-    app.add_plugins(bevy::image::ImagePlugin::default());
-    app.init_asset::<BinaryMaterial>();
-    app.register_asset_reflect::<BinaryMaterial>();
-    app.insert_resource(JackdawCatalogPath(dir.join("catalog.bsn")));
-    app.add_plugins(JackdawPlugin);
-    app
-}
-
 #[test]
 fn the_runtime_loads_a_material_held_in_the_binary_form() {
     let type_path = <BinaryMaterial as TypePath>::type_path();
     let dir = unique_temp_dir("binary-material");
     std::fs::create_dir_all(dir.join("materials")).unwrap();
-    let text = jackdaw_bsn::with_asset_header(type_path, &format!("#grass\n{type_path}\n"));
-    jackdaw_bsn::write_document_text(&dir.join("materials/grass.bsb"), &text).unwrap();
-
-    let mut app = app_over(&dir);
-    app.update();
-
-    let catalog = app.world().resource::<JackdawCatalog>();
-    assert!(
-        catalog.get("materials/grass.bsn").is_some(),
-        "a binary material answers to the path its text twin would sit at"
-    );
-    assert!(
-        catalog.get("materials/grass.bsb").is_some(),
-        "and to the path it is written at"
-    );
-    assert!(
-        catalog.get("@grass").is_some(),
-        "and to the one name it carries"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_document_held_in_both_forms_is_loaded_once_from_its_text() {
-    let type_path = <BinaryMaterial as TypePath>::type_path();
-    let dir = unique_temp_dir("binary-material-pair");
-    std::fs::create_dir_all(dir.join("materials")).unwrap();
     let text = jackdaw_bsn::with_asset_header(
         type_path,
-        &format!("#grass\n{type_path} {{ tint: 1.0 }}\n"),
+        &format!("#grass\n{type_path} {{ tint: 0.5 }}\n"),
     );
-    jackdaw_bsn::write_document_text(&dir.join("materials/grass.bsn"), &text).unwrap();
     jackdaw_bsn::write_document_text(&dir.join("materials/grass.bsb"), &text).unwrap();
 
-    let mut app = app_over(&dir);
-    app.update();
+    let file_path = dir.to_string_lossy().into_owned();
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.add_plugins(JackdawAssetSourcePlugin {
+        file_path: file_path.clone(),
+        ..Default::default()
+    });
+    app.add_plugins(AssetPlugin {
+        file_path,
+        ..Default::default()
+    });
+    app.add_plugins(TransformPlugin);
+    app.add_plugins(WorldSerializationPlugin);
+    app.add_plugins(ImagePlugin::default());
+    app.init_asset::<BinaryMaterial>()
+        .register_asset_reflect::<BinaryMaterial>()
+        .register_type_data::<BinaryMaterial, ReflectBsnAsset>();
+    app.add_plugins(JackdawPlugin);
 
-    let catalog = app.world().resource::<JackdawCatalog>();
-    assert!(
-        catalog.get("materials/grass.bsn").is_some(),
-        "the text file is the one that loaded"
-    );
+    let material: Handle<BinaryMaterial> = app
+        .world()
+        .resource::<AssetServer>()
+        .load("materials/grass.bsn#Asset");
+    let tint = util::wait_for(&mut app, "the binary material", |app| {
+        app.world()
+            .resource::<Assets<BinaryMaterial>>()
+            .get(&material)
+            .map(|material| material.tint)
+    });
     assert_eq!(
-        catalog.len(),
-        2,
-        "the pair is one asset under one path and one name, not two"
+        tint, 0.5,
+        "the binary pair is unified"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

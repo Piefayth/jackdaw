@@ -6,11 +6,13 @@
 //! Headless, so no texture decodes and the surfaces carry the untextured
 //! material rather than the splat one.
 
-use std::path::{Path, PathBuf};
+mod util;
+
+use std::path::Path;
 
 use bevy::asset::AssetApp;
 use bevy::prelude::*;
-use jackdaw_runtime::{JackdawCatalogPath, JackdawPlugin, JackdawScene, JackdawSceneRoot};
+use jackdaw_runtime::{JackdawPlugin, JackdawScene, JackdawSceneRoot};
 use jackdaw_terrain::sidecar::{self, RegionTerrainData, TerrainMaterialSlot};
 
 const RESOLUTION: u32 = 65;
@@ -41,7 +43,6 @@ fn project(sidecar_bytes: Option<Vec<u8>>) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     let assets = tmp.path().join("assets");
     std::fs::create_dir_all(assets.join("materials")).expect("materials dir");
-    std::fs::write(assets.join("catalog.bsn"), "// no catalog entries\n").expect("catalog");
     std::fs::write(
         assets.join("materials/grass.material.bsn"),
         "#grass\nbevy_pbr::pbr_material::StandardMaterial {\n    \
@@ -57,7 +58,7 @@ fn project(sidecar_bytes: Option<Vec<u8>>) -> tempfile::TempDir {
 /// A hill under one material slot, at the scene's resolution.
 fn authored_sidecar() -> Vec<u8> {
     let mut data = RegionTerrainData {
-        materials: vec![TerrainMaterialSlot::new("grass")],
+        materials: vec![TerrainMaterialSlot::new("materials/grass.material.bsn")],
         ..default()
     };
     let _ = data.regions.ensure_grid(RESOLUTION);
@@ -86,20 +87,16 @@ fn game_with(assets_root: &Path, scene: &str) -> App {
     });
     // The mesh store a windowed game gets from its render plugins.
     app.init_asset::<Mesh>();
-    // Both the catalog and the sidecar are resolved against this root.
-    app.insert_resource(JackdawCatalogPath(assets_root.join("catalog.bsn")));
     app.add_plugins(JackdawPlugin);
     app.world_mut().spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 20.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    let handle = app
-        .world_mut()
-        .resource_mut::<Assets<JackdawScene>>()
-        .add(JackdawScene::new(scene.to_string(), PathBuf::new()));
+    std::fs::write(assets_root.join("zone.bsn"), scene).expect("scene");
+    let handle: Handle<JackdawScene> = app.world().resource::<AssetServer>().load("zone.bsn");
     app.world_mut().spawn(JackdawSceneRoot(handle));
-    app.update();
+    util::settle_scenes(&mut app);
     app.update();
     app
 }

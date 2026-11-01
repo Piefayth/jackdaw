@@ -2,8 +2,9 @@
 //! A model whose import settings list levels of detail draws them live
 //! wherever it is placed, with no LOD group of its own.
 
+mod util;
+
 use std::path::Path;
-use std::time::Duration;
 
 use bevy::asset::AssetApp;
 use bevy::camera::primitives::Aabb;
@@ -265,17 +266,6 @@ fn write_tree(dir: &Path, lod: Option<ModelLod>) {
     }
 }
 
-/// Run `app` until `done` holds, or fail after a few seconds.
-fn run_until(app: &mut App, what: &str, mut done: impl FnMut(&mut App) -> bool) {
-    for _ in 0..1000 {
-        app.update();
-        if done(app) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("{what} never happened");
-}
 
 fn node_lod(levels: &[&[&str]]) -> ModelLod {
     ModelLod {
@@ -313,7 +303,7 @@ fn a_model_without_a_meta_is_placed_as_one_instance() {
     let mut app = game(project.path());
     let tree = place_model(&mut app, "tree.gltf");
 
-    run_until(&mut app, "the instance", |app| {
+    util::wait_until(&mut app, "the instance", |app| {
         app.world().get::<WorldAssetRoot>(tree).is_some()
     });
 
@@ -333,7 +323,7 @@ fn a_model_with_a_lod_meta_is_never_placed_as_an_instance() {
     let mut app = game(project.path());
     let tree = place_model(&mut app, "tree.gltf");
 
-    run_until(&mut app, "the live levels", |app| {
+    util::wait_until(&mut app, "the live levels", |app| {
         app.world().get::<LiveLevels>(tree).is_some()
     });
     settle(&mut app, 20);
@@ -355,7 +345,7 @@ fn a_nodes_level_flattens_only_its_nodes() {
     let key = nodes_key("tree.gltf", &["Tree_LOD1".to_string(), "Rocks".to_string()]);
     app.world_mut().resource_mut::<ModelParts>().request(&key);
 
-    run_until(&mut app, "the flattened level", |app| {
+    util::wait_until(&mut app, "the flattened level", |app| {
         app.world().resource::<ModelParts>().get(&key).is_some()
     });
 
@@ -383,7 +373,7 @@ fn an_edited_meta_updates_the_models_placed_from_it() {
     );
     let mut app = game(project.path());
     let tree = place_model(&mut app, "tree.gltf");
-    run_until(&mut app, "two levels", |app| {
+    util::wait_until(&mut app, "two levels", |app| {
         app.world()
             .get::<ModelLevels>(tree)
             .is_some_and(|levels| levels.models.len() == 2)
@@ -397,7 +387,7 @@ fn an_edited_meta_updates_the_models_placed_from_it() {
         .resource_mut::<ModelLodIndex>()
         .reread("tree.gltf");
 
-    run_until(&mut app, "three levels", |app| {
+    util::wait_until(&mut app, "three levels", |app| {
         app.world()
             .get::<ModelLevels>(tree)
             .is_some_and(|levels| levels.models.len() == 3)
@@ -414,7 +404,7 @@ fn a_model_with_a_meta_loads_the_same_scene_as_one_without() {
     app.world_mut()
         .resource_mut::<ModelLodIndex>()
         .request("tree.gltf");
-    run_until(&mut app, "the meta read", |app| {
+    util::wait_until(&mut app, "the meta read", |app| {
         app.world()
             .resource::<ModelLodIndex>()
             .is_known("tree.gltf")
@@ -431,7 +421,7 @@ fn a_model_with_a_meta_loads_the_same_scene_as_one_without() {
         "plain.gltf",
     );
 
-    run_until(&mut app, "both models", |app| {
+    util::wait_until(&mut app, "both models", |app| {
         let gltfs = app.world().resource::<Assets<bevy::gltf::Gltf>>();
         gltfs.contains(&imported) && gltfs.contains(&plain)
     });

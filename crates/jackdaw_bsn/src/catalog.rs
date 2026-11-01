@@ -16,8 +16,9 @@ use bevy::ecs::reflect::AppTypeRegistry;
 use bevy::ecs::world::World;
 
 use crate::{
-    BsnAssetContext, BsnPatch, BsnPatches, BsnValue, SceneBsnAst, bsn_value_to_reflect,
-    component_to_bsn_patch, component_to_bsn_patch_with_assets, emit_scene, parse_bsn_text,
+    BsnApplyAssets, BsnAssetContext, BsnPatch, BsnPatches, BsnValue, SceneBsnAst,
+    bsn_value_to_reflect, component_to_bsn_patch, component_to_bsn_patch_with_assets, emit_scene,
+    parse_bsn_text, server_loads,
 };
 
 pub use crate::loader::BsnLoadError;
@@ -55,10 +56,10 @@ pub fn load_bsn_assets(
 
     let registry = world.resource::<AppTypeRegistry>().clone();
     let server = world.get_resource::<AssetServer>().cloned();
-    let assets_ctx = server.as_ref().map(|s| crate::BsnApplyAssets {
-        server: s,
-        local: None,
-    });
+    let loads = server.as_ref().map(server_loads);
+    let assets_ctx = loads
+        .as_ref()
+        .map(|load| BsnApplyAssets { load, local: None });
     let reg = registry.read();
 
     let mut entries = Vec::new();
@@ -273,18 +274,6 @@ pub fn adopt_asset_roots(world: &mut World, source: &SceneBsnAst) -> Vec<String>
     dropped
 }
 
-/// Load the asset one document root holds into its `Assets<T>` store.
-pub fn load_asset_root(
-    world: &mut World,
-    ast: &SceneBsnAst,
-    root: bevy::ecs::entity::Entity,
-) -> Option<UntypedHandle> {
-    let (type_path, asset_value) = asset_value_from_root(ast, root)?;
-    let registry = world.resource::<AppTypeRegistry>().clone();
-    let reg = registry.read();
-    load_asset_value(world, &reg, &type_path, &asset_value)
-}
-
 /// Build one named asset from its document value and insert it into its
 /// `Assets<T>` store.
 fn load_asset_entry(
@@ -313,10 +302,10 @@ fn load_asset_value(
     let type_id = registration.type_id();
 
     let server = world.get_resource::<AssetServer>().cloned();
-    let assets_ctx = server.as_ref().map(|s| crate::BsnApplyAssets {
-        server: s,
-        local: None,
-    });
+    let loads = server.as_ref().map(server_loads);
+    let assets_ctx = loads
+        .as_ref()
+        .map(|load| BsnApplyAssets { load, local: None });
     let value = bsn_value_to_reflect(asset_value, type_id, reg, assets_ctx.as_ref())?;
     Some(reflect_asset.add(world, &*value))
 }

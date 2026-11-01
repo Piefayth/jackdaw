@@ -57,13 +57,9 @@ serde_json.workspace = true
 thiserror = "2"
 
 [features]
-default = ["render", "soft_shadows"]
+default = ["render", "soft_shadows", "import"]
 render = [
     "dep:jackdaw_surface",
-    # Textures imported with Bevy's `CompressedImageSaver` are Basis files,
-    # written and read back with Bevy's basis-universal support.
-    "bevy/basis-universal",
-    "bevy/compressed_image_saver_universal",
     "bevy/bevy_pbr",
     "bevy/bevy_gltf",
     "bevy/bevy_render",
@@ -73,6 +69,13 @@ render = [
     # `bevy_feathers` depends on `bevy_render` outright, so the theme markers
     # an authored widget carries can only be registered in a rendering build.
     "jackdaw_widgets_runtime/feathers",
+]
+# disable basis and lods so web works
+import = [
+    "render",
+    "bevy/basis-universal",
+    "bevy/compressed_image_saver_universal",
+    "jackdaw_scene_types/import",
 ]
 # Percentage-closer soft shadows: a light's soft shadow size widens its shadows'
 # penumbras with distance from the caster. On by default; off for GPUs whose
@@ -98,10 +101,11 @@ pie = [
 # catalog, and the surface is built with the same splat material and clipmap
 # mesher the editor uses. Off by default: a game with no terrain does not link
 # the mesher or the shader.
-terrain = ["render", "navmesh", "jackdaw_terrain/render"]
+terrain = ["render", "dep:jackdaw_terrain", "jackdaw_terrain/render"]
 # Load the navmesh baked beside a scene, as a `JackdawNavmesh` on the scene
 # root. Decoding only: nothing is meshed and nothing is drawn, so a server that
-# validates moves takes this without `terrain`.
+# validates moves takes this without `terrain`. A scene with no bake still
+# costs a request for one, so only a game that bakes turns this on.
 navmesh = ["dep:jackdaw_terrain"]
 # Play the animation sets a scene authored. Bevy's own animation and glTF
 # support come with it, since a set's clips are named animations in a glTF

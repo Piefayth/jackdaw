@@ -24,7 +24,7 @@ pub mod writer;
 
 pub use catalog::{
     CatalogAssetRef, CatalogEntry, LoadedBsnScene, adopt_asset_roots, append_assets_to_ast,
-    asset_roots, asset_value_from_root, entity_roots, is_asset_root, load_asset_root,
+    asset_roots, asset_value_from_root, entity_roots, is_asset_root,
     load_bsn_assets, load_bsn_scene, serialize_assets_to_bsn, serialize_assets_to_bsn_reporting,
 };
 
@@ -62,10 +62,11 @@ pub use loader::{BsnLoadError, parse_bsn_text};
 pub use retired::{RETIRED_UI_PREFIX, RetiredUiComponents, reject_retired_ui_components};
 
 pub use apply::{
-    AstDirty, BsnApplyAssets, BsnAssetPaths, BsnProjectAssets, BsnSceneAssets, DocumentOnlyTypes,
-    UnresolvedTypes, apply_ast_to_ecs, apply_component_patch, apply_dirty_ast_patches,
+    AstDirty, BsnApplyAssets, BsnAssetPaths, BsnProjectAssets, BsnSceneAssets,
+    DOCUMENT_ASSET_LABEL, DocumentOnlyTypes, UnresolvedTypes, apply_ast_to_ecs,
+    asset_path_of_reference, apply_component_patch, apply_dirty_ast_patches,
     apply_reference_map, bsn_value_to_reflect, get_bsn_field, remove_bsn_field, set_bsn_field,
-    spawn_ast_node, spawn_from_ast,
+    server_loads, spawn_ast_node, spawn_from_ast,
 };
 
 pub use sync::{

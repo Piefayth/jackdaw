@@ -2,6 +2,8 @@
 //! forms is on disk, so a `.bsn` path written before an export still loads
 //! once the tree has been rewritten as `.bsb`.
 
+mod util;
+
 use std::path::Path;
 
 use bevy::asset::io::{AssetReaderError, AssetSourceBuilders, AssetSourceId};
@@ -56,16 +58,6 @@ fn spawn_scene(app: &mut App, path: &str) -> Handle<JackdawScene> {
     handle
 }
 
-fn pump(app: &mut App, mut done: impl FnMut(&mut App) -> bool) -> bool {
-    for _ in 0..200 {
-        app.update();
-        if done(app) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    false
-}
 
 fn named(app: &mut App, wanted: &str) -> bool {
     let mut names = app.world_mut().query::<&Name>();
@@ -80,9 +72,10 @@ fn a_scene_asked_for_as_text_spawns_from_its_binary_twin() {
     let mut app = scene_app(dir.path());
     spawn_scene(&mut app, "scene.bsn");
 
-    assert!(
-        pump(&mut app, |app| named(app, "Anchor")),
-        "the binary twin answered a reference written as text"
+    util::wait_until(
+        &mut app,
+        "the binary twin to answer a reference written as text",
+        |app| named(app, "Anchor"),
     );
 }
 
@@ -112,15 +105,15 @@ fn a_graph_asked_for_as_text_loads_from_its_binary_twin() {
         .resource::<AssetServer>()
         .load("animation/walk.animgraph.bsn");
 
-    let loaded = pump(&mut app, |app| {
-        app.world()
-            .resource::<Assets<AnimationGraphAsset>>()
-            .get(&handle)
-            .is_some()
-    });
-    assert!(
-        loaded,
-        "a graph reference written as text reached the binary twin"
+    util::wait_until(
+        &mut app,
+        "a graph reference written as text to reach the binary twin",
+        |app| {
+            app.world()
+                .resource::<Assets<AnimationGraphAsset>>()
+                .get(&handle)
+                .is_some()
+        },
     );
     let graphs = app.world().resource::<Assets<AnimationGraphAsset>>();
     assert_eq!(graphs.get(&handle).expect("the graph").def.entry, "idle");
@@ -133,13 +126,12 @@ fn a_document_in_neither_form_fails_as_not_found() {
     let mut app = scene_app(dir.path());
     let handle = spawn_scene(&mut app, "nowhere.bsn");
 
-    let failed = pump(&mut app, |app| {
+    util::wait_until(&mut app, "the load to give up rather than hang", |app| {
         app.world()
             .resource::<AssetServer>()
             .load_state(&handle)
             .is_failed()
     });
-    assert!(failed, "the load gave up rather than hanging");
 
     let LoadState::Failed(err) = app.world().resource::<AssetServer>().load_state(&handle) else {
         panic!("the load reported a failure");
@@ -163,10 +155,9 @@ fn a_document_on_disk_in_both_forms_loads_the_text_one() {
     let mut app = scene_app(dir.path());
     spawn_scene(&mut app, "scene.bsn");
 
-    assert!(
-        pump(&mut app, |app| named(app, "Anchor")),
-        "the text file is the one that loaded"
-    );
+    util::wait_until(&mut app, "the text file to load", |app| {
+        named(app, "Anchor")
+    });
     assert!(
         !named(&mut app, "Spare"),
         "the binary twin was left where it sat"

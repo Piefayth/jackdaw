@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use bevy::asset::LoadContext;
 use bevy::prelude::*;
 use jackdaw_terrain::navmesh::{self, NavmeshArtifact};
 
@@ -33,41 +34,36 @@ use jackdaw_terrain::navmesh::{self, NavmeshArtifact};
 pub struct JackdawNavmesh(pub NavmeshArtifact);
 
 /// Read the navmesh beside the scene that just spawned, if it has one.
-///
-/// A reload spawns onto the same root, so any existing component is dropped
-/// first: every path that ends without an artifact is a scene with no
-/// navmesh, and keeping the previous one would answer moves from ground that
-/// is gone.
+pub(crate) async fn read_navmesh(
+    scene_dir: &Path,
+    stem: Option<&str>,
+    load_context: &mut LoadContext<'_>,
+) -> Option<Result<NavmeshArtifact, String>> {
+    // A scene built from text in memory has no file name to look beside.
+    let stem = stem.filter(|stem| !stem.is_empty())?;
+    let path = scene_dir.join(format!("{stem}.{}", navmesh::EXTENSION));
+    let bytes = load_context.read_asset_bytes(path.clone()).await.ok()?;
+    Some(navmesh::decode(&bytes).map_err(|err| {
+        format!(
+            "navmesh {} is unreadable ({err}); this scene loads without one",
+            path.display()
+        )
+    }))
+}
+
 pub(crate) fn attach_navmesh(
     world: &mut World,
     root_entity: Entity,
-    parent_path: &Path,
-    stem: Option<&str>,
+    navmesh: &Option<Result<NavmeshArtifact, String>>,
 ) {
     world.entity_mut(root_entity).remove::<JackdawNavmesh>();
-
-    // A scene built from text in memory has no file name to look beside.
-    let Some(stem) = stem.filter(|stem| !stem.is_empty()) else {
-        return;
-    };
-    let Some(assets) = crate::assets_root(world) else {
-        return;
-    };
-    let path = assets
-        .join(parent_path)
-        .join(format!("{stem}.{}", navmesh::EXTENSION));
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
-    };
-    match navmesh::decode(&bytes) {
-        Ok(artifact) => {
+    match navmesh {
+        Some(Ok(artifact)) => {
             world
                 .entity_mut(root_entity)
-                .insert(JackdawNavmesh(artifact));
+                .insert(JackdawNavmesh(artifact.clone()));
         }
-        Err(err) => error!(
-            "navmesh {} is unreadable ({err}); this scene loads without one",
-            path.display()
-        ),
+        Some(Err(reason)) => error!("{reason}"),
+        None => {}
     }
 }

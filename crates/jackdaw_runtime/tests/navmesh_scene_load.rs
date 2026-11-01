@@ -1,4 +1,4 @@
-#![cfg(feature = "terrain")]
+#![cfg(all(feature = "terrain", feature = "navmesh"))]
 //! One app holding the whole game-side contract: an asset folder, a scene
 //! path, and [`JackdawPlugin`]. What comes back is the authored ground drawn
 //! at the extent the sidecar states, plus the navmesh baked beside the scene.
@@ -6,9 +6,12 @@
 //! Headless, so no texture decodes and the surfaces carry the untextured
 //! material rather than the splat one.
 
+mod util;
+
 use std::path::Path;
 
-use bevy::asset::AssetApp;
+use bevy::asset::{AssetApp, AssetEvent};
+use bevy::ecs::message::MessageReader;
 use bevy::prelude::*;
 use jackdaw_runtime::{JackdawNavmesh, JackdawPlugin, JackdawScene, JackdawSceneRoot};
 use jackdaw_terrain::navmesh::{self, NO_NEIGHBOR, NavPolygon, NavmeshArtifact};
@@ -122,32 +125,29 @@ fn game(assets: &Path) -> App {
     let handle: Handle<JackdawScene> = app.world().resource::<AssetServer>().load("scene.bsn");
     app.world_mut().spawn(JackdawSceneRoot(handle));
 
-    // The scene arrives on an asset-server task, so the spawn loop is pumped
-    // until it does.
-    for _ in 0..200 {
-        app.update();
-        if app
-            .world_mut()
-            .query::<&JackdawSceneRoot>()
-            .iter(app.world())
-            .count()
-            > 0
-            && app
-                .world_mut()
-                .query::<&jackdaw_scene_types::Terrain>()
-                .iter(app.world())
-                .next()
-                .is_some()
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    app.init_resource::<Reloads>()
+        .add_systems(First, count_reloads);
+
+    util::settle_scenes(&mut app);
     // A few more frames for the sidecar to decode and the clipmap to mesh.
-    for _ in 0..4 {
+    for _ in 0..2 {
         app.update();
     }
     app
+}
+
+/// How many times the scene asset has been replaced by a reload.
+#[derive(Resource, Default)]
+struct Reloads(usize);
+
+fn count_reloads(
+    mut events: MessageReader<AssetEvent<JackdawScene>>,
+    mut reloads: ResMut<Reloads>,
+) {
+    reloads.0 += events
+        .read()
+        .filter(|event| matches!(event, AssetEvent::Modified { .. }))
+        .count();
 }
 
 /// Every vertex the terrain drew, in world space.
@@ -297,16 +297,13 @@ fn navmeshes(app: &mut App) -> usize {
 /// arrives in: the spawned members are despawned and the surviving root spawns
 /// from the asset again.
 fn reload_scene(app: &mut App) {
-    let world = app.world_mut();
-    let handle = world
-        .query::<&JackdawSceneRoot>()
-        .iter(world)
-        .next()
-        .expect("a scene root")
-        .0
-        .clone();
-    world.write_message(bevy::asset::AssetEvent::Modified { id: handle.id() });
-    for _ in 0..4 {
-        app.update();
-    }
+    let before = app.world().resource::<Reloads>().0;
+    app.world()
+        .resource::<AssetServer>()
+        .reload("scene.bsn");
+    util::wait_until(app, "the scene to reload", |app| {
+        app.world().resource::<Reloads>().0 > before
+    });
+    app.update();
+    app.update();
 }

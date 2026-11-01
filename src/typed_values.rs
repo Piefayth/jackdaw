@@ -16,7 +16,7 @@ use bevy::asset::{AssetServer, ReflectHandle, UntypedHandle};
 use bevy::color::palettes::css;
 use bevy::prelude::*;
 use bevy::reflect::{PartialReflect, TypeInfo, TypeRegistry, enums::VariantInfo};
-use jackdaw_bsn::{BsnApplyAssets, BsnValue, bsn_value_to_reflect};
+use jackdaw_bsn::{BsnApplyAssets, BsnValue, bsn_value_to_reflect, server_loads};
 use path_slash::PathExt as _;
 
 /// Whether a field of this type names its value by asset path.
@@ -92,8 +92,9 @@ pub fn text_value_for_field(
     text: &str,
 ) -> Option<Box<dyn PartialReflect>> {
     if takes_asset_path(registry, type_id) {
-        let assets = server.map(|server| BsnApplyAssets {
-            server,
+        let loads = server.map(server_loads);
+        let assets = loads.as_ref().map(|load| BsnApplyAssets {
+            load,
             local: references,
         });
         return bsn_value_to_reflect(

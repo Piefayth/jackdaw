@@ -118,13 +118,16 @@ pub struct ModelLoader {
     /// The loader every model's file goes through.
     pub gltf: GltfLoader,
     /// Where generated levels are kept between loads.
+    #[cfg(feature = "import")]
     pub cache: GeneratedLevelCache,
 }
 
 /// The folder generated levels are cached in, once an app names one.
+#[cfg(feature = "import")]
 #[derive(Resource, Clone, Default)]
 pub struct GeneratedLevelCache(pub Arc<std::sync::RwLock<Option<std::path::PathBuf>>>);
 
+#[cfg(feature = "import")]
 impl GeneratedLevelCache {
     /// Keep generated levels under `folder` from now on.
     pub fn set(&self, folder: Option<std::path::PathBuf>) {
@@ -152,6 +155,7 @@ impl AssetLoader for ModelLoader {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
         let gltf = GltfLoader::load_gltf(&self.gltf, &bytes, load_context, &settings.gltf).await?;
+        #[cfg(feature = "import")]
         if let Some(lod) = &settings.lod {
             self.add_generated_levels(&gltf, &bytes, lod, load_context);
         }
@@ -163,6 +167,7 @@ impl AssetLoader for ModelLoader {
     }
 }
 
+#[cfg(feature = "import")]
 impl ModelLoader {
     /// Add every generated level of every primitive, labelled
     /// `Lod<level>/Mesh<m>/Primitive<p>`, from the cache when it holds them.
@@ -466,16 +471,20 @@ pub struct ModelImportPlugin;
 impl Plugin for ModelImportPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ModelLodIndex>()
-            .init_resource::<GeneratedLevelCache>()
             .add_observer(index_placed_model)
             .add_observer(unindex_placed_model)
             .add_systems(PreUpdate, (read_model_lods, resolve_model_levels).chain());
     }
 
     fn finish(&self, app: &mut App) {
+        #[cfg(feature = "import")]
+        app.init_resource::<GeneratedLevelCache>();
         if let Some(gltf) = gltf_loader(app) {
-            let cache = app.world().resource::<GeneratedLevelCache>().clone();
-            app.register_asset_loader(ModelLoader { gltf, cache })
+            app.register_asset_loader(ModelLoader {
+                gltf,
+                #[cfg(feature = "import")]
+                cache: app.world().resource::<GeneratedLevelCache>().clone(),
+            })
                 .add_systems(PreUpdate, reread_reloaded_models.before(read_model_lods));
         }
     }

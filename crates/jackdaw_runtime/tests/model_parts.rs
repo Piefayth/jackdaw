@@ -2,6 +2,8 @@
 //! A model flattened into its parts puts each part where spawning the model
 //! would have put the same mesh.
 
+mod util;
+
 use std::path::Path;
 
 use bevy::asset::AssetApp;
@@ -76,10 +78,8 @@ fn a_flattened_model_places_each_part_where_a_spawned_one_does() {
         .load("nested.gltf#Scene0");
     app.world_mut().spawn((placed, WorldAssetRoot(scene)));
 
-    let mut spawned = Vec::new();
-    for _ in 0..500 {
-        app.update();
-        spawned = app
+    let mut spawned = util::wait_for(&mut app, "both parts to spawn", |app| {
+        let spawned = app
             .world_mut()
             .query_filtered::<&GlobalTransform, With<Mesh3d>>()
             .iter(app.world())
@@ -90,11 +90,8 @@ fn a_flattened_model_places_each_part_where_a_spawned_one_does() {
             .resource::<ModelParts>()
             .get("nested.gltf")
             .is_some();
-        if ready && spawned.len() == 2 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+        (ready && spawned.len() == 2).then_some(spawned)
+    });
     let model = app
         .world()
         .resource::<ModelParts>()

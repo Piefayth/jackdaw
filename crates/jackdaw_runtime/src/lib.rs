@@ -64,23 +64,35 @@
 //! - `pie`: play-in-editor, streaming this world to a running editor.
 
 use std::any::TypeId;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 // Only the texture-format promotion pass gathers bound image ids, and that is
 // a rendering build's concern.
 #[cfg(feature = "render")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use bevy::asset::{AssetLoader, LoadContext, ReflectAsset, UntypedHandle, io::Reader};
+use bevy::asset::{AssetLoader, LoadContext, LoadState, ReflectAsset, UntypedHandle, io::Reader};
 use bevy::ecs::reflect::AppTypeRegistry;
 use bevy::prelude::*;
-use bevy::reflect::TypeRegistry;
+use bevy::reflect::{CreateTypeData, PartialReflect, TypeRegistry};
 #[cfg(feature = "render")]
 use bevy::world_serialization::{WorldAsset, WorldAssetRoot};
 use jackdaw_bsn::{
-    BsnApplyAssets, BsnPatch, BsnSceneAssets, BsnValue, SceneBsnAst, apply_component_patch,
-    bsn_value_to_reflect, load_bsn_assets, parse_bsn_text,
+    BsnApplyAssets, BsnPatch, BsnSceneAssets, BsnValue, DOCUMENT_ASSET_LABEL, PREFAB_TYPE,
+    SceneBsnAst, apply_component_patch, asset_value_from_root, bsn_value_to_reflect,
+    document_text_from_bytes, emit_scene, is_asset_root, is_document_path, parse_bsn_text,
+    read_asset_header, reject_retired_ui_components, root_type_path, server_loads,
 };
+use jackdaw_prefab::{
+    ISA_TYPE, isa_value, normalize_as_prefab_source, read_isa_deleted, read_isa_source,
+    resolve_scene, set_whole_component,
+};
+#[cfg(feature = "render")]
+use jackdaw_scene_types::{render_assets::drawn_texture_settings, to_asset_path};
+#[cfg(feature = "render")]
+use jackdaw_surface::{FoliageMaterial, LayeredSurfaceMaterial, WaterMaterial};
+#[cfg(feature = "navmesh")]
+use jackdaw_terrain::navmesh::NavmeshArtifact;
 
 pub use jackdaw_scene_types::{
     Brush, BrushFaceData, CustomProperties, DetailPresser, EditorCategory, EditorDescription,
@@ -134,7 +146,7 @@ mod navmesh;
 pub use navmesh::JackdawNavmesh;
 
 mod hidden_in_game;
-#[cfg(feature = "render")]
+#[cfg(feature = "import")]
 pub mod texture_import;
 mod twin;
 pub use twin::{DocumentTwinReader, JackdawAssetSourcePlugin, with_document_twins};
@@ -150,8 +162,8 @@ pub mod prelude {
     pub use crate::JackdawNavmesh;
     pub use crate::{
         DetailPresser, EditorCategory, EditorDescription, EditorHidden, EditorPreview,
-        JackdawAssetSourcePlugin, JackdawCatalog, JackdawCatalogPath, JackdawPlugin,
-        JackdawSceneMember, JackdawSceneRoot, SceneRefused, SkipSerialization,
+        DocumentAsset, JackdawAssetSourcePlugin, JackdawDocuments, JackdawPlugin, JackdawSceneMember,
+        JackdawSceneRoot, ReflectBsnAsset, SceneRefused, SkipSerialization,
     };
     #[cfg(feature = "terrain")]
     pub use crate::{DetailPressers, DetailSettings, DetailViewer, TerrainViewer};
@@ -217,15 +229,9 @@ impl Plugin for JackdawPlugin {
         // registered, and exits before `App::run` opens a window.
         schema_cli::extract_schema_and_exit_if_requested(app);
 
-        // Sidecars and the catalog are read from the filesystem rather than
-        // through the asset server, so the folder Bevy reads assets from is
-        // recovered from the `AssetPlugin` this app added. It is only
-        // readable while the app is being built, so it is captured here.
-        app.insert_resource(AssetFolder(asset_folder(app)));
-
         propagate_into_reused_indices(app);
 
-        #[cfg(feature = "render")]
+        #[cfg(feature = "import")]
         texture_import::register_texture_import_processor(app);
 
         // Registers every scene type for reflection and installs
@@ -270,9 +276,8 @@ impl Plugin for JackdawPlugin {
 
         app.init_asset::<JackdawScene>()
             .init_asset_loader::<JackdawSceneLoader>()
-            .init_resource::<JackdawCatalog>();
+            .init_resource::<JackdawDocuments>();
 
-        app.add_systems(Startup, load_asset_files);
         app.add_systems(
             Update,
             (
@@ -296,6 +301,15 @@ impl Plugin for JackdawPlugin {
             MaterialOverridesPlugin,
             LodPlugin,
         ));
+        #[cfg(feature = "render")]
+        app.register_type::<StandardMaterial>()
+            .register_type_data::<StandardMaterial, ReflectBsnAsset>()
+            .register_type::<LayeredSurfaceMaterial>()
+            .register_type_data::<LayeredSurfaceMaterial, ReflectBsnAsset>()
+            .register_type::<FoliageMaterial>()
+            .register_type_data::<FoliageMaterial, ReflectBsnAsset>()
+            .register_type::<WaterMaterial>()
+            .register_type_data::<WaterMaterial, ReflectBsnAsset>();
 
         // Game code may add a model to an entity long after the scene it lives
         // in was loaded, and such a source resolves exactly as an authored one.
@@ -332,49 +346,84 @@ impl Plugin for JackdawPlugin {
     }
 }
 
-/// Project-wide asset catalog. Maps the references found in scene files to
-/// loaded `UntypedHandle`s: the assets-relative path of an asset file, and the
-/// `@Name` the same asset was spelled by before references were paths.
-///
-/// Populated at startup by a walk of the asset root (mirrors
-/// `FileAssetReader::get_base_path()`) and then of `catalog.bsn`. To read from
-/// a different location, insert a [`JackdawCatalogPath`] resource before
-/// [`JackdawPlugin`] is built.
+/// fork - JackdawDocuments is effectively cache of bsn documents keyed by reference
 #[derive(Resource, Default)]
-pub struct JackdawCatalog {
-    handles: HashMap<String, UntypedHandle>,
-    files: HashMap<String, UntypedHandle>,
+pub struct JackdawDocuments(HashMap<String, Handle<JackdawScene>>);
+
+impl JackdawDocuments {
+
+    pub fn asset(
+        &mut self,
+        server: &AssetServer,
+        documents: &Assets<JackdawScene>,
+        reference: &str,
+    ) -> DocumentAsset {
+        if !is_document_path(Path::new(reference)) {
+            return DocumentAsset::Missing;
+        }
+        let handle = self
+            .0
+            .entry(reference.to_owned())
+            .or_insert_with(|| server.load(reference.to_owned()));
+        if let Some(document) = documents.get(&*handle) {
+            return document
+                .asset
+                .clone()
+                .map_or(DocumentAsset::Missing, DocumentAsset::Held);
+        }
+        match server.load_state(&*handle) {
+            LoadState::Failed(_) => DocumentAsset::Missing,
+            _ => DocumentAsset::Loading,
+        }
+    }
 }
 
-impl JackdawCatalog {
-    /// Look up a catalog handle by the reference a document spells it as: the
-    /// path of the file holding it, or its `@Name`.
-    pub fn get(&self, name: &str) -> Option<&UntypedHandle> {
-        self.handles.get(name).or_else(|| self.files.get(name))
-    }
+/// fork - state machine for document loading state
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentAsset {
+    /// The document has not finished loading.
+    Loading,
+    /// The asset the document holds.
+    Held(UntypedHandle),
+    /// The reference names no document, one that failed to load, or one that
+    /// holds no asset.
+    Missing,
+}
 
-    /// Number of references the catalog answers to.
-    pub fn len(&self) -> usize {
-        self.handles.len() + self.files.len()
-    }
+/// fork - for referencing our bsn #Asset labels we need to reflect out the "real"
+/// underlying types for them to resolve to
+#[derive(Clone)]
+pub struct ReflectBsnAsset {
+    add: fn(
+        &mut LoadContext,
+        &mut dyn FnMut(&mut LoadContext) -> Option<Box<dyn PartialReflect>>,
+    ) -> Option<UntypedHandle>,
+}
 
-    /// True when no catalog has been loaded.
-    pub fn is_empty(&self) -> bool {
-        self.handles.is_empty() && self.files.is_empty()
+impl<A: Asset + FromReflect> CreateTypeData<A> for ReflectBsnAsset {
+    fn create_type_data(_input: ()) -> Self {
+        Self {
+            add: add_document_asset::<A>,
+        }
     }
 }
 
-/// Optional override for where the project's assets are read from. Insert this
-/// resource before [`JackdawPlugin`] to name an explicit `catalog.bsn`; its
-/// directory is the root the walk covers.
-#[derive(Resource, Clone, Debug)]
-pub struct JackdawCatalogPath(pub PathBuf);
+fn add_document_asset<A: Asset + FromReflect>(
+    load_context: &mut LoadContext,
+    value: &mut dyn FnMut(&mut LoadContext) -> Option<Box<dyn PartialReflect>>,
+) -> Option<UntypedHandle> {
+    load_context
+        .labeled_asset_scope(DOCUMENT_ASSET_LABEL, |load_context| {
+            let value = value(load_context).ok_or(())?;
+            A::from_reflect(value.as_ref()).ok_or(())
+        })
+        .ok()
+        .map(Handle::untyped)
+}
 
-/// A loaded `.bsn` scene, kept as its source text plus the origin metadata
-/// the spawn loop needs. The document is parsed on spawn rather than stored,
-/// since [`SceneBsnAst`] owns a private [`World`] and cannot be cloned out of
-/// the asset store.
-#[derive(Asset, TypePath)]
+/// fork - this is still a "loaded bsn scene" but now that loading is async 
+/// the data we are loading needs somewhere to be for now; might as well stick it here
+#[derive(Asset, TypePath, Clone)]
 pub struct JackdawScene {
     bsn: String,
     parent_path: PathBuf,
@@ -383,18 +432,30 @@ pub struct JackdawScene {
     /// the editor's Live tree shows the scene name instead of an entity id.
     /// `None` when the asset was built without a source path.
     stem: Option<String>,
+    asset: Option<UntypedHandle>,
+    #[cfg(feature = "terrain")]
+    terrain: terrain::TerrainFiles,
+    #[cfg(feature = "navmesh")]
+    navmesh: Option<Result<NavmeshArtifact, String>>,
 }
 
 impl JackdawScene {
     /// Build a scene asset directly from in-memory `.bsn` text.
-    /// Used by integration tests that drive scene-load codepaths
-    /// without a real `.bsn` file on disk.
     pub fn new(bsn: String, parent_path: PathBuf) -> Self {
         Self {
             bsn,
             parent_path,
             stem: None,
+            asset: None,
+            #[cfg(feature = "terrain")]
+            terrain: default(),
+            #[cfg(feature = "navmesh")]
+            navmesh: None,
         }
+    }
+
+    fn holding(self, asset: Option<UntypedHandle>) -> Self {
+        Self { asset, ..self }
     }
 
     /// Like [`JackdawScene::new`] but with an explicit source file stem, so
@@ -404,6 +465,11 @@ impl JackdawScene {
             bsn,
             parent_path,
             stem,
+            asset: None,
+            #[cfg(feature = "terrain")]
+            terrain: default(),
+            #[cfg(feature = "navmesh")]
+            navmesh: None,
         }
     }
 }
@@ -452,8 +518,18 @@ struct SceneSpawned;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneRefused;
 
-#[derive(TypePath, Default)]
-struct JackdawSceneLoader;
+#[derive(TypePath)]
+struct JackdawSceneLoader {
+    registry: AppTypeRegistry,
+}
+
+impl FromWorld for JackdawSceneLoader {
+    fn from_world(world: &mut World) -> Self {
+        Self {
+            registry: world.resource::<AppTypeRegistry>().clone(),
+        }
+    }
+}
 
 impl AssetLoader for JackdawSceneLoader {
     type Asset = JackdawScene;
@@ -472,35 +548,137 @@ impl AssetLoader for JackdawSceneLoader {
             .await
             .map_err(|e| JackdawLoadError::Io(e.to_string()))?;
 
-        let text = jackdaw_bsn::document_text_from_bytes(&bytes, load_context.path().path())
+        let text = document_text_from_bytes(&bytes, load_context.path().path())
             .map_err(|e| JackdawLoadError::Parse(e.to_string()))?;
-
-        // Parse once at load so a malformed scene fails here with a clear
-        // error rather than silently spawning nothing later. The document is
-        // rebuilt from `bsn` on spawn (it owns a `World` and cannot be stored
-        // in the asset).
-        let ast = parse_bsn_text(&text).map_err(|e| JackdawLoadError::Parse(e.to_string()))?;
-
-        // A document naming a component the engine does not have would load as
-        // a scene missing part of itself, so the load fails here by name.
-        jackdaw_bsn::reject_retired_ui_components(&ast)
-            .map_err(|e| JackdawLoadError::RetiredComponents(e.to_string()))?;
 
         let source_path = load_context.path().path();
         let parent_path = source_path.parent().unwrap_or(Path::new("")).to_owned();
         let stem = source_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned());
+        let scene_name = load_context.path().to_string();
+
+
+        let (asset, sources) = {
+            let mut ast = parse_scene(&text)?;
+            let asset = self.document_asset(&ast, &text, load_context);
+            // a file holding an asset isn't a scene
+            if asset.is_some() {
+                return Ok(JackdawScene::with_stem(text, parent_path, stem).holding(asset));
+            }
+            let sources = match normalize_isa_sources(&mut ast) {
+                Ok(()) => isa_sources(&ast),
+                Err(outside) => {
+                    warn!(
+                        "Scene '{scene_name}' references the prefab {} from outside the asset \
+                         root; refusing to read it, and spawning the scene as authored",
+                        outside.display()
+                    );
+                    Vec::new()
+                }
+            };
+            (asset, sources)
+        };
+        let prefabs = read_prefabs(sources, &scene_name, load_context).await;
+
+        #[cfg(feature = "terrain")]
+        let terrain_paths;
+        let bsn = {
+            let ast = resolve_prefab_references(parse_scene(&text)?, &scene_name, &prefabs);
+            reject_retired_ui_components(&ast)
+                .map_err(|e| JackdawLoadError::RetiredComponents(e.to_string()))?;
+            #[cfg(feature = "terrain")]
+            {
+                terrain_paths = terrain::terrain_data_paths(&ast);
+            }
+            if prefabs.is_empty() {
+                text
+            } else {
+                emit_scene(&ast)
+            }
+        };
 
         Ok(JackdawScene {
-            bsn: text,
+            #[cfg(feature = "terrain")]
+            terrain: terrain::read_terrain_files(terrain_paths, &parent_path, load_context).await,
+            #[cfg(feature = "navmesh")]
+            navmesh: navmesh::read_navmesh(&parent_path, stem.as_deref(), load_context).await,
+            bsn,
             parent_path,
             stem,
+            asset,
         })
     }
 
     fn extensions(&self) -> &[&str] {
         &["bsn", "bsb"]
+    }
+}
+
+impl JackdawSceneLoader {
+    /// fork - actually build and load the underlying asset
+    fn document_asset(
+        &self,
+        ast: &SceneBsnAst,
+        text: &str,
+        load_context: &mut LoadContext,
+    ) -> Option<UntypedHandle> {
+        let root = *ast.roots.first()?;
+        if !ast.get_children_ast(root).is_empty()
+            || ast
+                .find_patch_by_type_path(root, PREFAB_TYPE)
+                .is_some()
+        {
+            return None;
+        }
+        let type_path = root_type_path(ast, root)
+            .or_else(|| read_asset_header(text))?;
+        let reg = self.registry.read();
+        let registration = reg.get_with_type_path(&type_path)?;
+        let Some(bsn_asset) = registration.data::<ReflectBsnAsset>().cloned() else {
+            if registration.data::<ReflectAsset>().is_some() {
+                warn!(
+                    "{} holds a {type_path}, which this app cannot build from a file; \
+                     register it with `register_type_data::<_, ReflectBsnAsset>()`",
+                    load_context.path()
+                );
+            }
+            return None;
+        };
+        let type_id = registration.type_id();
+        let (_, value) = asset_value_from_root(ast, root)?;
+        if ast.roots.len() > 1 {
+            warn!(
+                "{} holds {} values; only the first answers to its path",
+                load_context.path(),
+                ast.roots.len()
+            );
+        }
+        (bsn_asset.add)(load_context, &mut |load_context| {
+            let load_context = std::cell::RefCell::new(load_context);
+            #[cfg(feature = "render")]
+            let _preloaded_textures = preload_textures(ast, |path, linear| {
+                load_context
+                    .borrow_mut()
+                    .load_builder()
+                    .with_settings(drawn_texture_settings(
+                        linear,
+                    ))
+                    .load::<Image>(path.to_owned())
+                    .untyped()
+            });
+            let load = |type_id, path: &str| {
+                load_context
+                    .borrow_mut()
+                    .load_builder()
+                    .load_erased(type_id, path.to_owned())
+            };
+            let assets = BsnApplyAssets {
+                load: &load,
+                local: None,
+            };
+            bsn_value_to_reflect(&value, type_id, &reg, Some(&assets))
+        })
     }
 }
 
@@ -557,7 +735,7 @@ fn clear_modified_scene_roots(
 /// progress answers `None`.
 fn scene_load_failure(world: &World, handle: &Handle<JackdawScene>) -> Option<String> {
     match world.get_resource::<AssetServer>()?.get_load_state(handle) {
-        Some(bevy::asset::LoadState::Failed(err)) => Some(err.to_string()),
+        Some(LoadState::Failed(err)) => Some(err.to_string()),
         _ => None,
     }
 }
@@ -590,17 +768,11 @@ pub(crate) fn spawn_loaded_scenes(
             world.entity_mut(root_entity).remove::<SceneRefused>();
         }
 
-        let loaded = {
-            let scenes = world.resource::<Assets<JackdawScene>>();
-            scenes.get(&handle).map(|scene| {
-                (
-                    scene.bsn.clone(),
-                    scene.parent_path.clone(),
-                    scene.stem.clone(),
-                )
-            })
-        };
-        let Some((bsn, parent_path, stem)) = loaded else {
+        let loaded = world
+            .resource::<Assets<JackdawScene>>()
+            .get(&handle)
+            .cloned();
+        let Some(scene) = loaded else {
             // A document the asset loader refuses never reaches the gates
             // below, so the root would otherwise sit empty with nothing to say
             // why.
@@ -613,7 +785,13 @@ pub(crate) fn spawn_loaded_scenes(
             continue;
         };
 
-        let ast = match parse_bsn_text(&bsn) {
+        let JackdawScene {
+            bsn,
+            parent_path,
+            stem,
+            ..
+        } = &scene;
+        let ast = match parse_bsn_text(bsn) {
             Ok(ast) => ast,
             Err(err) => {
                 warn!("Failed to parse scene .bsn: {err}");
@@ -624,8 +802,6 @@ pub(crate) fn spawn_loaded_scenes(
             }
         };
 
-        // Names this scene in anything the prefab pass has to refuse, so a game
-        // loading several at once can tell which one degraded.
         let scene_name = match stem.as_deref().filter(|s| !s.is_empty()) {
             Some(stem) => parent_path
                 .join(format!("{stem}.bsn"))
@@ -633,13 +809,11 @@ pub(crate) fn spawn_loaded_scenes(
                 .to_string(),
             None => "a scene built in memory".to_string(),
         };
-        let ast = resolve_prefab_references(world, ast, &scene_name, &parent_path);
-
         // Spawning is the one place every route meets, including in-memory
         // text through `JackdawScene::new`, and it reads the resolved document
         // because a prefab base can hand retired vocabulary to an instance
         // whose own file never names it.
-        if let Err(err) = jackdaw_bsn::reject_retired_ui_components(&ast) {
+        if let Err(err) = reject_retired_ui_components(&ast) {
             warn!("Cannot spawn scene '{scene_name}': {err}");
             world
                 .entity_mut(root_entity)
@@ -647,21 +821,21 @@ pub(crate) fn spawn_loaded_scenes(
             continue;
         }
 
-        let members = spawn_scene_entities(world, root_entity, &ast, &parent_path);
+        let members = spawn_scene_entities(world, root_entity, &ast, &scene);
         world
             .entity_mut(root_entity)
             .insert(SceneInstanceMembers(members));
 
         // A bake is saved under the scene's own name, which is known here.
         #[cfg(feature = "navmesh")]
-        navmesh::attach_navmesh(world, root_entity, &parent_path, stem.as_deref());
+        navmesh::attach_navmesh(world, root_entity, &scene.navmesh);
 
         // Give the container root a readable name from the scene's file
         // stem so the editor's Live tree shows the scene name instead of an
         // entity id. Never overwrite an author-supplied name, and never
         // insert an empty one.
         if world.get::<Name>(root_entity).is_none()
-            && let Some(stem) = stem.filter(|s| !s.is_empty())
+            && let Some(stem) = stem.clone().filter(|s| !s.is_empty())
         {
             world.entity_mut(root_entity).insert(Name::new(stem));
         }
@@ -681,6 +855,115 @@ pub(crate) fn spawn_loaded_scenes(
     }
 }
 
+fn parse_scene(text: &str) -> Result<SceneBsnAst, JackdawLoadError> {
+    parse_bsn_text(text).map_err(|e| JackdawLoadError::Parse(e.to_string()))
+}
+
+pub(crate) fn asset_root_source(source: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut folded = PathBuf::new();
+    for component in source.components() {
+        match component {
+            Component::Normal(part) => folded.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !folded.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(folded)
+}
+
+/// fork - prefab paths can be written different ways so we make a canonical one
+fn normalize_isa_sources(ast: &mut SceneBsnAst) -> Result<(), PathBuf> {
+    for node in ast.entities_with_component(ISA_TYPE) {
+        let Some(source) = read_isa_source(ast, node) else {
+            continue;
+        };
+        let folded = asset_root_source(&source).ok_or_else(|| source.clone())?;
+        if folded != source {
+            let deleted = read_isa_deleted(ast, node);
+            set_whole_component(
+                ast,
+                node,
+                ISA_TYPE,
+                isa_value(&folded.to_string_lossy(), &deleted),
+            );
+        }
+    }
+    Ok(())
+}
+
+enum PrefabRead {
+    Unreadable(String),
+    Outside(PathBuf),
+}
+
+impl std::fmt::Display for PrefabRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(err) => f.write_str(err),
+            Self::Outside(source) => write!(
+                f,
+                "it references {} from outside the asset root",
+                source.display()
+            ),
+        }
+    }
+}
+
+pub(crate) fn parse_prefab(path: &Path, text: &str) -> Result<SceneBsnAst, PrefabRead> {
+    let mut ast = parse_bsn_text(text).map_err(|err| PrefabRead::Unreadable(err.to_string()))?;
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("scene");
+    normalize_as_prefab_source(&mut ast, name);
+    normalize_isa_sources(&mut ast).map_err(PrefabRead::Outside)?;
+    Ok(ast)
+}
+
+async fn read_prefabs(
+    mut pending: Vec<PathBuf>,
+    scene_name: &str,
+    load_context: &mut LoadContext<'_>,
+) -> HashMap<PathBuf, String> {
+    let mut texts = HashMap::new();
+    while let Some(path) = pending.pop() {
+        if texts.contains_key(&path) {
+            continue;
+        }
+        let text = match load_context.read_asset_bytes(path.clone()).await {
+            Ok(bytes) => document_text_from_bytes(&bytes, &path)
+                .map_err(|err| PrefabRead::Unreadable(err.to_string())),
+            Err(err) => Err(PrefabRead::Unreadable(err.to_string())),
+        };
+        let read = text.and_then(|text| {
+            let sources = isa_sources(&parse_prefab(&path, &text)?);
+            Ok((text, sources))
+        });
+        match read {
+            Ok((text, sources)) => {
+                pending.extend(sources);
+                texts.insert(path, text);
+            }
+            Err(PrefabRead::Unreadable(err)) => warn!(
+                "Scene '{scene_name}': failed to read prefab {}: {err}",
+                path.display()
+            ),
+            Err(PrefabRead::Outside(outside)) => {
+                warn!(
+                    "Scene '{scene_name}' references the prefab {} from outside the asset \
+                     root",
+                    outside.display()
+                );
+                return HashMap::new();
+            }
+        }
+    }
+    texts
+}
+
 /// Materialize the prefab instances a scene document names.
 ///
 /// A scene stores an instance as an `IsA` pointing at another document plus the
@@ -692,42 +975,25 @@ pub(crate) fn spawn_loaded_scenes(
 /// its own asset root, since a reference is an instruction to open whatever it
 /// names and a scene file is content a player can replace.
 fn resolve_prefab_references(
-    world: &World,
     mut ast: SceneBsnAst,
     scene_name: &str,
-    scene_dir: &Path,
+    prefabs: &HashMap<PathBuf, String>,
 ) -> SceneBsnAst {
     if ast
-        .entities_with_component(jackdaw_prefab::ISA_TYPE)
+        .entities_with_component(ISA_TYPE)
         .is_empty()
     {
         return ast;
     }
-    let Some(assets_root) = assets_root(world) else {
-        warn!(
-            "Scene '{scene_name}' references a prefab but no asset root was found; \
-             spawning it as authored"
-        );
+    if normalize_isa_sources(&mut ast).is_err() {
         return ast;
-    };
-    let assets_root = jackdaw_prefab::normalize_path(&assets_root);
-    let document_dir = jackdaw_prefab::normalize_path(&assets_root.join(scene_dir));
-    jackdaw_prefab::absolutize_isa_sources(&mut ast, &assets_root, &document_dir);
-
-    let sources = match read_prefab_sources(&ast, &assets_root, scene_name) {
-        Ok(sources) => sources,
-        Err(outside) => {
-            warn!(
-                "Scene '{scene_name}' references the prefab {} from outside the asset root {}; \
-                 refusing to read it, and spawning the scene as authored",
-                outside.display(),
-                assets_root.display()
-            );
-            return ast;
-        }
-    };
-    let get_prefab = |path: &Path| sources.get(path);
-    match jackdaw_prefab::resolve_scene(&ast, &get_prefab) {
+    }
+    let documents: HashMap<PathBuf, SceneBsnAst> = prefabs
+        .iter()
+        .filter_map(|(path, text)| Some((path.clone(), parse_prefab(path, text).ok()?)))
+        .collect();
+    let get_prefab = |path: &Path| documents.get(path);
+    match resolve_scene(&ast, &get_prefab) {
         Ok(resolved) => resolved,
         Err(err) => {
             warn!(
@@ -738,84 +1004,46 @@ fn resolve_prefab_references(
     }
 }
 
-/// Reads every prefab document `ast` reaches, directly or through another
-/// prefab, keyed by the file each one came from.
-///
-/// Sources are normalized to real paths first, so a loop between two prefabs
-/// ends here. A source outside `assets_root` returns `Err(source)` before that
-/// file is opened, checked as it comes off the queue so a prefab reached
-/// through another is checked too.
-fn read_prefab_sources(
-    ast: &SceneBsnAst,
-    assets_root: &Path,
-    scene_name: &str,
-) -> Result<HashMap<PathBuf, SceneBsnAst>, PathBuf> {
-    let mut documents: HashMap<PathBuf, SceneBsnAst> = HashMap::new();
-    let mut pending = isa_sources(ast);
-    while let Some(path) = pending.pop() {
-        if documents.contains_key(&path) {
-            continue;
-        }
-        if !path.starts_with(assets_root) {
-            return Err(path);
-        }
-        let file = jackdaw_bsn::existing_form(&path).unwrap_or_else(|| path.clone());
-        match jackdaw_prefab::read_prefab_document(&file, assets_root) {
-            Ok(document) => {
-                pending.extend(isa_sources(&document));
-                documents.insert(path, document);
-            }
-            Err(err) => warn!(
-                "Scene '{scene_name}': failed to read prefab {}: {err}",
-                path.display()
-            ),
-        }
-    }
-    Ok(documents)
-}
-
 /// The sources every `IsA` in `ast` names, meaningful only once the document
-/// has been through `absolutize_isa_sources`.
+/// has been through [`normalize_isa_sources`].
 fn isa_sources(ast: &SceneBsnAst) -> Vec<PathBuf> {
-    ast.entities_with_component(jackdaw_prefab::ISA_TYPE)
+    ast.entities_with_component(ISA_TYPE)
         .into_iter()
-        .filter_map(|node| jackdaw_prefab::read_isa_source(ast, node))
+        .filter_map(|node| read_isa_source(ast, node))
         .collect()
 }
 
 /// Spawn a scene document's entities under `root_entity`.
 ///
 /// Embedded named-asset roots load into their `Assets<T>` stores first (so
-/// `#Name`/`@Name` references resolve), then entity roots spawn parent-first
+/// `#Name` references resolve), then entity roots spawn parent-first
 /// by walking `roots` and each node's `Children` relation.
 fn spawn_scene_entities(
     world: &mut World,
     root_entity: Entity,
     ast: &SceneBsnAst,
-    parent_path: &Path,
+    scene: &JackdawScene,
 ) -> Vec<Entity> {
     let registry = world.resource::<AppTypeRegistry>().clone();
 
     #[cfg(feature = "render")]
-    let _preloaded_textures = preload_textures(world, ast);
+    let _preloaded_textures = {
+        let server = world.resource::<AssetServer>();
+        preload_textures(ast, |path, linear| {
+            server
+                .load_builder()
+                .with_settings(drawn_texture_settings(
+                    linear,
+                ))
+                .load::<Image>(path.to_owned())
+                .untyped()
+        })
+    };
 
-    // Embedded assets keyed as both `#Name` (scene-inline) and `@Name`
-    // (catalog spelling), merged with the project catalog under every
-    // reference it answers to. Kept in `BsnSceneAssets` so
-    // `apply_component_patch` resolves reference strings.
-    let mut local_assets = load_embedded_assets(world, ast, &registry);
-    {
-        let catalog = world.resource::<JackdawCatalog>();
-        let entries: Vec<(String, UntypedHandle)> = catalog
-            .handles
-            .iter()
-            .chain(catalog.files.iter())
-            .map(|(name, handle)| (name.clone(), handle.clone()))
-            .collect();
-        for (name, handle) in entries {
-            local_assets.entry(name).or_insert(handle);
-        }
-    }
+    // Embedded assets keyed as `#Name`, kept in `BsnSceneAssets` so
+    // `apply_component_patch` resolves reference strings. A reference to a
+    // file loads through the asset server instead.
+    let local_assets = load_embedded_assets(world, ast, &registry);
     let mut scene_assets = bevy::platform::collections::HashMap::default();
     for (name, handle) in &local_assets {
         scene_assets.insert(name.clone(), handle.clone());
@@ -848,7 +1076,6 @@ fn spawn_scene_entities(
 
     #[cfg(feature = "render")]
     {
-        let assets_dir = assets_root(world);
         let asset_server = world.resource::<AssetServer>().clone();
         let gltf_entities: Vec<(Entity, jackdaw_scene_types::GltfSource)> = spawned
             .iter()
@@ -871,20 +1098,17 @@ fn spawn_scene_entities(
                         &asset_server,
                         world.get_resource(),
                         &source,
-                        assets_dir.as_deref(),
                     );
                     world.entity_mut(entity).insert(root);
                 }
             }
         }
     }
-    // A terrain's sidecar is named relative to the scene file, whose
-    // directory is known here.
     #[cfg(feature = "terrain")]
-    terrain::attach_sidecars(world, &spawned, parent_path);
+    terrain::attach_sidecars(world, &spawned, &scene.terrain);
 
     #[cfg(not(feature = "terrain"))]
-    let _ = parent_path;
+    let _ = scene;
 
     members
 }
@@ -902,9 +1126,8 @@ fn world_asset_root(
     asset_server: &AssetServer,
     imports: Option<&jackdaw_scene_types::model_import::ModelLodIndex>,
     source: &jackdaw_scene_types::GltfSource,
-    assets_dir: Option<&Path>,
 ) -> WorldAssetRoot {
-    let path = jackdaw_scene_types::to_asset_path(&source.path, assets_dir);
+    let path = to_asset_path(&source.path, None);
     let scene: Handle<WorldAsset> = jackdaw_scene_types::render_assets::load_model(
         asset_server,
         imports,
@@ -1018,12 +1241,10 @@ fn attach_model(world: &mut World, entity: Entity) {
                 .insert(live_levels::AwaitingModelSettings);
         }
         live_levels::ModelPlacement::Instance => {
-            let assets_dir = assets_root(world);
             let root = world_asset_root(
                 world.resource::<AssetServer>(),
                 world.get_resource(),
                 &source,
-                assets_dir.as_deref(),
             );
             let mut entity = world.entity_mut(entity);
             if entity
@@ -1222,34 +1443,6 @@ fn convert_component<T: bevy::reflect::FromReflect>(
     <T as bevy::reflect::FromReflect>::from_reflect(reflected.as_ref())
 }
 
-/// The asset type path and value carried by a document root's component patch.
-/// Mirrors the private helper in `jackdaw_bsn::catalog`.
-fn asset_value_from_root(ast: &SceneBsnAst, root: Entity) -> Option<(String, BsnValue)> {
-    let patches = ast.get_patches(root)?;
-    for &pe in &patches.0 {
-        match ast.get_patch(pe)? {
-            BsnPatch::Struct(data) => {
-                return Some((data.type_path.clone(), BsnValue::Struct(data.clone())));
-            }
-            BsnPatch::TupleStruct(data) => {
-                return Some((data.type_path.clone(), BsnValue::TupleStruct(data.clone())));
-            }
-            BsnPatch::Type(tp) => return Some((tp.clone(), BsnValue::Type(tp.clone()))),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Whether a document root is a named asset entry (its component patch resolves
-/// to a registered `Asset` type). Scene loading routes these into `Assets<T>`
-/// stores instead of spawning them as entities.
-fn is_asset_root(ast: &SceneBsnAst, root: Entity, reg: &TypeRegistry) -> bool {
-    asset_value_from_root(ast, root)
-        .and_then(|(type_path, _)| reg.get_with_type_path(&type_path))
-        .is_some_and(|registration| registration.data::<ReflectAsset>().is_some())
-}
-
 /// Load a scene's embedded named assets into their `Assets<T>` stores.
 /// Returns a map of `#Name` and `@Name` reference strings to handles.
 fn load_embedded_assets(
@@ -1279,8 +1472,9 @@ fn load_embedded_assets(
         let Some(name) = ast.get_name(root).map(str::to_owned) else {
             continue;
         };
+        let load = server_loads(&server);
         let assets_ctx = BsnApplyAssets {
-            server: &server,
+            load: &load,
             local: None,
         };
         let Some(value) = bsn_value_to_reflect(&asset_value, type_id, &reg, Some(&assets_ctx))
@@ -1288,8 +1482,7 @@ fn load_embedded_assets(
             continue;
         };
         let handle = reflect_asset.add(world, &*value);
-        map.insert(format!("#{name}"), handle.clone());
-        map.insert(format!("@{name}"), handle);
+        map.insert(format!("#{name}"), handle);
     }
 
     map
@@ -1336,19 +1529,13 @@ fn collect_texture_slots(ast: &SceneBsnAst) -> Vec<(String, bool)> {
 /// the generic resolve reaches the same paths. The returned handles keep the
 /// images alive until the materials hold their own.
 #[cfg(feature = "render")]
-fn preload_textures(world: &mut World, ast: &SceneBsnAst) -> Vec<UntypedHandle> {
-    let asset_server = world.resource::<AssetServer>().clone();
+fn preload_textures(
+    ast: &SceneBsnAst,
+    mut load: impl FnMut(&str, bool) -> UntypedHandle,
+) -> Vec<UntypedHandle> {
     collect_texture_slots(ast)
         .into_iter()
-        .map(|(path, linear)| {
-            asset_server
-                .load_builder()
-                .with_settings(jackdaw_scene_types::render_assets::drawn_texture_settings(
-                    linear,
-                ))
-                .load::<Image>(&path)
-                .untyped()
-        })
+        .map(|(path, linear)| load(&path, linear))
         .collect()
 }
 
@@ -1471,553 +1658,6 @@ fn promote_material_texture_formats(
         if let Some(mut image) = images.get_mut(id) {
             image.texture_descriptor.format = twin;
         }
-    }
-}
-
-/// The file the project's remaining named assets are read from, under the
-/// asset root.
-const CATALOG_FILE: &str = "catalog.bsn";
-
-/// Startup system: read the project's asset files into [`JackdawCatalog`].
-///
-/// Every `.bsn` under the asset root is sniffed for the type it holds, and one
-/// that holds a registered asset is loaded under the path it sits at and,
-/// while a project still spells references by name, under its stem. The
-/// entries `catalog.bsn` holds are read after the files, so a file wins the
-/// name it shares with one.
-///
-/// Honours [`JackdawCatalogPath`] if present; otherwise mirrors Bevy's
-/// `FileAssetReader::get_base_path()` to find the asset root.
-fn load_asset_files(world: &mut World) {
-    let root = assets_root(world);
-    let catalog_path = world
-        .get_resource::<JackdawCatalogPath>()
-        .map(|path| path.0.clone())
-        .or_else(|| root.as_ref().map(|root| root.join(CATALOG_FILE)))
-        .and_then(|path| jackdaw_bsn::existing_form(&path).or(Some(path)));
-
-    if let Some(root) = root.clone() {
-        load_walked_assets(world, &root, catalog_path.as_deref());
-    }
-
-    let Some(catalog_path) = catalog_path else {
-        return;
-    };
-    if !catalog_path.is_file() {
-        info!(
-            "No catalog at {}, skipping catalog load",
-            catalog_path.display()
-        );
-        return;
-    }
-
-    let text = match jackdaw_bsn::read_document_text(&catalog_path) {
-        Ok(text) => text,
-        Err(err) => {
-            warn!("Failed to read catalog {}: {err}", catalog_path.display());
-            return;
-        }
-    };
-
-    #[cfg(feature = "render")]
-    let _preloaded_textures = parse_bsn_text(&text)
-        .ok()
-        .map(|ast| preload_textures(world, &ast))
-        .unwrap_or_default();
-
-    match load_bsn_assets(world, &text) {
-        Ok(entries) => {
-            let count = entries.len();
-            let mut catalog = world.resource_mut::<JackdawCatalog>();
-            for entry in entries {
-                // A file already holding the name wins over the inline entry.
-                catalog
-                    .handles
-                    .entry(format!("@{}", entry.name))
-                    .or_insert(entry.handle);
-            }
-            info!(
-                "Loaded project catalog with {count} entries from {}",
-                catalog_path.display()
-            );
-        }
-        Err(err) => warn!("Failed to parse catalog {}: {err}", catalog_path.display()),
-    }
-}
-
-/// Walk the asset files under `root` into [`JackdawCatalog`], skipping the
-/// catalog file, which is read as a document of its own.
-///
-/// A file whose header names a type this app does not load is passed over on
-/// the header alone; one with no header costs the parse that tells a file
-/// holding an asset from one spawning a scene.
-fn load_walked_assets(world: &mut World, root: &Path, catalog_path: Option<&Path>) {
-    let began = std::time::Instant::now();
-    let mut stems = jackdaw_bsn::StemIndex::default();
-    let mut loaded: Vec<(String, String, UntypedHandle)> = Vec::new();
-    let mut skipped = SkippedTypes::default();
-    let mut binary_seen = false;
-    let mut walked = 0usize;
-
-    for path in jackdaw_bsn::walk_document_files(root) {
-        if !jackdaw_bsn::is_document_path(&path) || Some(path.as_path()) == catalog_path {
-            continue;
-        }
-        binary_seen |= jackdaw_bsn::is_binary_path(&path);
-        let Some(key) = assets_relative_key(root, &jackdaw_bsn::text_twin(&path)) else {
-            continue;
-        };
-        stems.insert(PathBuf::from(&key));
-        walked += 1;
-        let Some(handle) = load_asset_file(world, &path, &mut skipped) else {
-            continue;
-        };
-        {
-            let mut catalog = world.resource_mut::<JackdawCatalog>();
-            catalog.files.insert(key.clone(), handle.clone());
-            if let Some(written) = assets_relative_key(root, &path) {
-                catalog.files.insert(written, handle.clone());
-            }
-        }
-        loaded.push((jackdaw_bsn::path_stem(&path), key, handle));
-    }
-
-    let count = loaded.len();
-    let mut ambiguous: Vec<String> = Vec::new();
-    {
-        let mut catalog = world.resource_mut::<JackdawCatalog>();
-        for (stem, _, handle) in loaded {
-            if stems.unique(&stem).is_some() {
-                catalog.handles.insert(format!("@{stem}"), handle);
-            } else if !ambiguous.contains(&stem) {
-                ambiguous.push(stem);
-            }
-        }
-    }
-    for stem in ambiguous {
-        if let Some((first, second)) = stems.shared(&stem) {
-            warn!(
-                "'{stem}' names both {} and {}; spell the one you mean as a path",
-                first.display(),
-                second.display()
-            );
-        }
-    }
-
-    skipped.report();
-    debug!(
-        "Walked {walked} documents under {} in {:?}",
-        root.display(),
-        began.elapsed()
-    );
-    if binary_seen && !world.contains_resource::<twin::DocumentTwins>() {
-        warn!(
-            "Documents under {} are in the binary form; add JackdawAssetSourcePlugin before DefaultPlugins so a .bsn reference loads its twin through the asset server",
-            root.display()
-        );
-    }
-    if count > 0 {
-        info!("Loaded {count} asset files from {}", root.display());
-    }
-}
-
-/// The types the walk passed over, so a project whose materials this app does
-/// not render costs one line rather than one per file.
-#[derive(Default)]
-struct SkippedTypes {
-    unregistered: BTreeMap<String, usize>,
-    unreflected: BTreeMap<String, usize>,
-    on_header: usize,
-}
-
-impl SkippedTypes {
-    fn report(&self) {
-        if self.on_header > 0 {
-            warn!(
-                "Took {} asset files at their header's word: a header naming a type this app does not load keeps the file out of the catalog, whatever its first root says",
-                self.on_header
-            );
-        }
-        if !self.unregistered.is_empty() {
-            warn!(
-                "Skipped {} asset files holding types this app has not registered: {}",
-                self.unregistered.values().sum::<usize>(),
-                summarize(&self.unregistered)
-            );
-        }
-        if !self.unreflected.is_empty() {
-            warn!(
-                "Skipped {} asset files holding types this app registered without register_asset_reflect: {}",
-                self.unreflected.values().sum::<usize>(),
-                summarize(&self.unreflected)
-            );
-        }
-    }
-}
-
-fn summarize(counts: &BTreeMap<String, usize>) -> String {
-    counts
-        .iter()
-        .map(|(type_path, count)| format!("{type_path} ({count})"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Whether this app registered a type, and whether it registered it as an
-/// asset. `None` for a type it has never heard of.
-fn asset_registration(world: &World, type_path: &str) -> Option<bool> {
-    let registry = world.resource::<AppTypeRegistry>().read();
-    registry
-        .get_with_type_path(type_path)
-        .map(|registration| registration.data::<ReflectAsset>().is_some())
-}
-
-/// Load the asset the file at `path` holds, or nothing when it holds a scene,
-/// a prefab, or a type this app has not registered as an asset.
-///
-/// A file whose header names a type this app will not load is passed over on
-/// the header alone, before it is parsed.
-fn load_asset_file(
-    world: &mut World,
-    path: &Path,
-    skipped: &mut SkippedTypes,
-) -> Option<UntypedHandle> {
-    let text = match jackdaw_bsn::read_document_text(path) {
-        Ok(text) => text,
-        Err(err) => {
-            warn!("Failed to read {}: {err}", path.display());
-            return None;
-        }
-    };
-    let header = jackdaw_bsn::read_asset_header(&text);
-    if let Some(header) = header.clone() {
-        match asset_registration(world, &header) {
-            None => {
-                *skipped.unregistered.entry(header).or_default() += 1;
-                skipped.on_header += 1;
-                return None;
-            }
-            Some(false) => {
-                *skipped.unreflected.entry(header).or_default() += 1;
-                skipped.on_header += 1;
-                return None;
-            }
-            Some(true) => {}
-        }
-    }
-    let ast = match parse_bsn_text(&text) {
-        Ok(ast) => ast,
-        Err(err) => {
-            warn!("Failed to parse {}: {err}", path.display());
-            return None;
-        }
-    };
-    let root = *ast.roots.first()?;
-    if !ast.get_children_ast(root).is_empty()
-        || ast
-            .find_patch_by_type_path(root, jackdaw_bsn::PREFAB_TYPE)
-            .is_some()
-    {
-        return None;
-    }
-    let type_path = jackdaw_bsn::root_type_path(&ast, root).or(header.clone())?;
-
-    match asset_registration(world, &type_path) {
-        None => {
-            *skipped.unregistered.entry(type_path).or_default() += 1;
-            return None;
-        }
-        Some(false) => {
-            if header.is_some() {
-                *skipped.unreflected.entry(type_path).or_default() += 1;
-            }
-            return None;
-        }
-        Some(true) => {}
-    }
-    if ast.roots.len() > 1 {
-        warn!(
-            "{} holds {} values; only the first answers to its path",
-            path.display(),
-            ast.roots.len()
-        );
-    }
-
-    #[cfg(feature = "render")]
-    let _preloaded_textures = preload_textures(world, &ast);
-
-    jackdaw_bsn::load_asset_root(world, &ast, root)
-}
-
-/// Where a file sits under the asset root, as the reference a document spells
-/// it by: forward slashes, whatever the platform's separator is.
-fn assets_relative_key(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    let mut key = String::new();
-    for component in relative.components() {
-        if !key.is_empty() {
-            key.push('/');
-        }
-        key.push_str(component.as_os_str().to_str()?);
-    }
-    (!key.is_empty()).then_some(key)
-}
-
-/// The folder Bevy reads assets from, as this app's [`AssetPlugin`] was
-/// configured. Captured when [`JackdawPlugin`] is built.
-#[derive(Resource, Clone, Debug)]
-struct AssetFolder(Option<PathBuf>);
-
-/// The asset root every sidecar and catalog path is resolved against: the
-/// directory [`JackdawCatalogPath`] points into when it is set, else the
-/// folder the app's [`AssetPlugin`] reads from.
-pub(crate) fn assets_root(world: &World) -> Option<PathBuf> {
-    resolve_assets_root(
-        world.get_resource::<JackdawCatalogPath>(),
-        world.get_resource::<AssetFolder>(),
-    )
-}
-
-/// [`assets_root`] over the two resources it reads, for systems that take them
-/// as parameters rather than reaching into the world.
-fn resolve_assets_root(
-    catalog_path: Option<&JackdawCatalogPath>,
-    asset_folder: Option<&AssetFolder>,
-) -> Option<PathBuf> {
-    if let Some(path) = catalog_path {
-        return path.0.parent().map(ToOwned::to_owned);
-    }
-    asset_folder.and_then(|folder| folder.0.clone())
-}
-
-/// Where the app reads assets from: [`AssetPlugin::file_path`] resolved the
-/// way `bevy::asset::io::file::FileAssetReader` resolves it, against
-/// `BEVY_ASSET_ROOT`, `CARGO_MANIFEST_DIR`, or the executable's directory.
-///
-/// With no `AssetPlugin` added yet, the default folder stands in.
-fn asset_folder(app: &App) -> Option<PathBuf> {
-    let file_path = app
-        .get_added_plugins::<AssetPlugin>()
-        .first()
-        .map_or_else(|| AssetPlugin::default().file_path, |p| p.file_path.clone());
-    let base = if let Ok(p) = std::env::var("BEVY_ASSET_ROOT") {
-        PathBuf::from(p)
-    } else if let Ok(p) = std::env::var("CARGO_MANIFEST_DIR") {
-        PathBuf::from(p)
-    } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(ToOwned::to_owned))?
-    };
-    Some(base.join(file_path))
-}
-
-#[cfg(test)]
-mod asset_file_tests {
-    use super::*;
-    use bevy::app::App;
-    use bevy::asset::{AssetApp, AssetPlugin};
-
-    /// A game's own asset type, registered by the app rather than compiled
-    /// into the runtime.
-    #[derive(Asset, Reflect, Default)]
-    #[reflect(Default)]
-    struct Recipe {
-        steps: u32,
-    }
-
-    fn runtime_app() -> App {
-        let mut app = App::new();
-        app.add_plugins((bevy::app::TaskPoolPlugin::default(), AssetPlugin::default()));
-        app.init_asset::<Image>();
-        app.init_asset::<StandardMaterial>();
-        app.register_asset_reflect::<Image>();
-        app.register_asset_reflect::<StandardMaterial>();
-        app.init_resource::<JackdawCatalog>();
-        app
-    }
-
-    const GRASS: &str =
-        "#grass\nbevy_pbr::pbr_material::StandardMaterial {\n    perceptual_roughness: 0.25,\n}\n";
-
-    fn write(root: &Path, relative: &str, text: &str) {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("a parent directory")).expect("dir");
-        std::fs::write(path, text).expect("write");
-    }
-
-    #[test]
-    fn a_missing_assets_directory_is_not_an_error() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        load_walked_assets(app.world_mut(), &tmp.path().join("gone"), None);
-        assert!(app.world().resource::<JackdawCatalog>().is_empty());
-    }
-
-    #[test]
-    fn an_asset_file_in_any_folder_answers_to_its_path() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "content/props/grass.material.bsn", GRASS);
-        write(tmp.path(), "content/props/notes.txt", "ignored");
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        let catalog = app.world().resource::<JackdawCatalog>();
-        assert!(
-            catalog.get("content/props/grass.material.bsn").is_some(),
-            "a material outside the materials folder is still the project's"
-        );
-    }
-
-    #[test]
-    fn an_asset_file_answers_to_the_name_its_stem_gives_it() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "materials/grass.material.bsn", GRASS);
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        let catalog = app.world().resource::<JackdawCatalog>();
-        assert_eq!(
-            catalog
-                .get("materials/grass.material.bsn")
-                .map(UntypedHandle::id),
-            catalog.get("@grass").map(UntypedHandle::id),
-            "a scene saved with the path reaches the same material the name did"
-        );
-    }
-
-    #[test]
-    fn two_files_of_one_stem_answer_by_path_and_neither_by_name() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "materials/grass.material.bsn", GRASS);
-        write(tmp.path(), "content/props/grass.bsn", GRASS);
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        let catalog = app.world().resource::<JackdawCatalog>();
-        assert!(catalog.get("materials/grass.material.bsn").is_some());
-        assert!(catalog.get("content/props/grass.bsn").is_some());
-        assert!(
-            catalog.get("@grass").is_none(),
-            "an ambiguous name stands for neither file"
-        );
-    }
-
-    #[test]
-    fn an_asset_type_the_game_registered_is_loaded_into_its_store() {
-        let mut app = runtime_app();
-        app.init_asset::<Recipe>();
-        app.register_asset_reflect::<Recipe>();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let type_path = <Recipe as TypePath>::type_path();
-        write(
-            tmp.path(),
-            "content/recipes/stew.bsn",
-            &jackdaw_bsn::with_asset_header(type_path, &format!("{type_path} {{ steps: 4 }}\n")),
-        );
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        let handle = app
-            .world()
-            .resource::<JackdawCatalog>()
-            .get("content/recipes/stew.bsn")
-            .cloned()
-            .expect("the file is in the catalog");
-        let handle = handle.try_typed::<Recipe>().expect("a recipe handle");
-        assert_eq!(
-            app.world()
-                .resource::<Assets<Recipe>>()
-                .get(&handle)
-                .map(|recipe| recipe.steps),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn a_file_naming_a_type_the_game_did_not_register_is_skipped() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "content/items/torch.bsn",
-            "#torch\nmy_game::content::ItemDef { damage: 3.0 }\n",
-        );
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        assert!(app.world().resource::<JackdawCatalog>().is_empty());
-    }
-
-    #[test]
-    fn an_asset_type_registered_without_its_reflection_is_skipped() {
-        let mut app = runtime_app();
-        app.init_asset::<Recipe>();
-        app.register_type::<Recipe>();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let type_path = <Recipe as TypePath>::type_path();
-        write(
-            tmp.path(),
-            "content/recipes/stew.bsn",
-            &jackdaw_bsn::with_asset_header(type_path, &format!("{type_path} {{ steps: 4 }}\n")),
-        );
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        assert!(app.world().resource::<JackdawCatalog>().is_empty());
-        assert!(app.world().resource::<Assets<Recipe>>().is_empty());
-    }
-
-    #[test]
-    fn a_scene_file_is_not_taken_for_an_asset() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "zones/starter.bsn",
-            "#Root\nbevy_transform::components::transform::Transform\nbevy_ecs::hierarchy::Children [\n    bevy_transform::components::transform::Transform\n]\n",
-        );
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-
-        assert!(app.world().resource::<JackdawCatalog>().is_empty());
-    }
-
-    #[test]
-    fn an_asset_file_outranks_an_inline_catalog_entry_of_the_same_name() {
-        let mut app = runtime_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "materials/grass.material.bsn", GRASS);
-
-        load_walked_assets(app.world_mut(), tmp.path(), None);
-        let from_file = app
-            .world()
-            .resource::<JackdawCatalog>()
-            .get("@grass")
-            .expect("file entry")
-            .clone();
-
-        // The catalog file is read second and must not displace it.
-        let inline = "#grass\nbevy_pbr::pbr_material::StandardMaterial {\n    perceptual_roughness: 0.9,\n}\n";
-        let entries = load_bsn_assets(app.world_mut(), inline).expect("parse");
-        let mut catalog = app.world_mut().resource_mut::<JackdawCatalog>();
-        for entry in entries {
-            catalog
-                .handles
-                .entry(format!("@{}", entry.name))
-                .or_insert(entry.handle);
-        }
-
-        assert_eq!(
-            app.world()
-                .resource::<JackdawCatalog>()
-                .get("@grass")
-                .map(UntypedHandle::id),
-            Some(from_file.id())
-        );
     }
 }
 

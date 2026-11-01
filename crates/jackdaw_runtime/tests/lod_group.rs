@@ -3,6 +3,8 @@
 
 #![cfg(feature = "render")]
 
+mod util;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use bevy::camera::visibility::VisibilityRange;
 use bevy::prelude::*;
 use bevy::world_serialization::WorldAssetRoot;
 use jackdaw_runtime::{
-    JackdawCatalogPath, JackdawPlugin, JackdawScene, JackdawSceneRoot, LiveLevelProgress,
+    JackdawPlugin, JackdawScene, JackdawSceneRoot, LiveLevelProgress,
     LiveLevelSettings, LodPart, LodPlugin, level_shows,
 };
 use jackdaw_scene_types::model_parts::{FlatModel, ModelPart, ModelParts};
@@ -256,8 +258,7 @@ const GROUP_WITH_A_MODEL_PAST_ITS_LEVELS: &str = "#Tree\n\
 
 #[test]
 fn a_lod_level_is_kept_live_rather_than_spawned_as_a_model_and_a_child_past_the_levels_is_not() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = runtime_app(dir.path());
+    let mut app = runtime_app();
     let scene = app
         .world_mut()
         .resource_mut::<Assets<JackdawScene>>()
@@ -266,15 +267,14 @@ fn a_lod_level_is_kept_live_rather_than_spawned_as_a_model_and_a_child_past_the_
             PathBuf::new(),
         ));
     app.world_mut().spawn(JackdawSceneRoot(scene));
-    settle_models(&mut app);
+    util::settle_models(&mut app);
 
     assert_eq!(placed_models(app.world_mut()), ["nest.gltf"]);
 }
 
 #[test]
 fn the_levels_of_a_group_that_goes_are_given_their_models() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = runtime_app(dir.path());
+    let mut app = runtime_app();
     let root = app.world_mut().spawn(heights(&[0.5, 0.1], 0.0)).id();
     for path in ["tree.gltf", "tree_LOD1.gltf"] {
         app.world_mut().spawn((
@@ -289,7 +289,7 @@ fn the_levels_of_a_group_that_goes_are_given_their_models() {
     assert!(placed_models(app.world_mut()).is_empty());
 
     app.world_mut().entity_mut(root).remove::<LodGroup>();
-    settle_models(&mut app);
+    util::settle_models(&mut app);
 
     assert_eq!(
         placed_models(app.world_mut()),
@@ -308,13 +308,12 @@ fn placed_models(world: &mut World) -> Vec<String> {
     paths
 }
 
-fn runtime_app(assets_root: &std::path::Path) -> App {
+fn runtime_app() -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.add_plugins(bevy::transform::TransformPlugin);
     app.add_plugins(AssetPlugin::default());
     app.add_plugins(bevy::world_serialization::WorldSerializationPlugin);
-    app.insert_resource(JackdawCatalogPath(assets_root.join("catalog.bsn")));
     app.add_plugins(JackdawPlugin);
     app
 }
@@ -725,25 +724,3 @@ fn forcing_a_level_shows_it_at_every_distance() {
     );
 }
 
-/// Run `app` until every placed model's import settings are read and the
-/// models waiting on them are placed.
-fn settle_models(app: &mut App) {
-    for _ in 0..200 {
-        app.update();
-        let reading = app
-            .world()
-            .resource::<jackdaw_scene_types::model_import::ModelLodIndex>()
-            .is_reading();
-        let waiting = app
-            .world_mut()
-            .query_filtered::<(), With<jackdaw_runtime::AwaitingModelSettings>>()
-            .iter(app.world())
-            .next()
-            .is_some();
-        if !reading && !waiting {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    app.update();
-}
