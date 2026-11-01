@@ -750,10 +750,9 @@ fn array_image(
     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
-        // jam edit: pixel perfect terrain textures
-        mag_filter: ImageFilterMode::Nearest,
-        min_filter: ImageFilterMode::Nearest,
-        mipmap_filter: ImageFilterMode::Nearest,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
         ..default()
     });
     image

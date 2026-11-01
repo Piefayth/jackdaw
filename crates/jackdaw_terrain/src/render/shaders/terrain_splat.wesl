@@ -154,6 +154,14 @@ fn turned_by(v: vec2<f32>, turn: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(turn.x * v.x - turn.y * v.y, turn.y * v.x + turn.x * v.y);
 }
 
+fn texel_sharp(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, size: vec2<f32>) -> vec2<f32> {
+    let texel = uv * size;
+    let footprint = clamp((abs(ddx) + abs(ddy)) * size, vec2<f32>(1e-5), vec2<f32>(1.0));
+    let edge = floor(texel + 0.5);
+    let across = smoothstep(-0.5 * footprint, 0.5 * footprint, texel - edge) - 0.5;
+    return (edge + across) / size;
+}
+
 // Break a tiled texture out of its grid.
 //
 // Every tile of the repeat is turned and shifted by its own amount, drawn from a
@@ -299,8 +307,10 @@ fn accumulate(
     var taken = 0.0;
     let has_occlusion = ((splat.occlusion_slots >> layer_id) & 1u) != 0u;
     let has_roughness = ((splat.roughness_slots >> layer_id) & 1u) != 0u;
+    let layer_size = vec2<f32>(textureDimensions(albedo_array));
     for (var t = 0u; t < tiled.count; t++) {
-        let tap = tiled.taps[t];
+        var tap = tiled.taps[t];
+        tap.uv = texel_sharp(tap.uv, tap.ddx, tap.ddy, layer_size);
         // A tile whose share has fallen to nothing is three samples that
         // change no pixel. The gradients are explicit, so this branch does
         // not have to be uniform.
