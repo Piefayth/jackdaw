@@ -45,6 +45,9 @@ const MAX_LAYERS: u32 = 16u;
 // default, 4% at normal incidence.
 const DEFAULT_REFLECTANCE: f32 = 0.5;
 
+// height a slot with no height map blends at
+const FLAT_HEIGHT: f32 = 128.0 / 255.0;
+
 struct SplatUniform {
     // 16 per-id UV scales, packed four to a vec4 for uniform alignment.
     uv_scales: array<vec4<f32>, 4>,
@@ -84,6 +87,8 @@ struct SplatUniform {
     // Bit i is set where texture id i has a roughness map. An id without
     // one takes `perceptual_roughness`.
     roughness_slots: u32,
+    normal_slots: u32,
+    height_slots: u32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> splat: SplatUniform;
@@ -307,6 +312,8 @@ fn accumulate(
     var taken = 0.0;
     let has_occlusion = ((splat.occlusion_slots >> layer_id) & 1u) != 0u;
     let has_roughness = ((splat.roughness_slots >> layer_id) & 1u) != 0u;
+    let has_normal = ((splat.normal_slots >> layer_id) & 1u) != 0u;
+    let has_height = ((splat.height_slots >> layer_id) & 1u) != 0u;
     let layer_size = vec2<f32>(textureDimensions(albedo_array));
     for (var t = 0u; t < tiled.count; t++) {
         var tap = tiled.taps[t];
@@ -319,21 +326,27 @@ fn accumulate(
         }
         albedo_sum += tap.weight
             * textureSampleGrad(albedo_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
-        height_sum += tap.weight
-            * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
-        let packed =
-            textureSampleGrad(normal_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
-        let unpacked = packed * 2.0 - 1.0;
-        // This tap's UV was turned by `tap.turn`, so its texture reads
-        // rotated by the inverse across the surface and the tangent-space
-        // normal stored in it has to turn back before the tiles are
-        // blended. Green is already in the shader's convention:
-        // `flip_normal_y` is applied on the way into the array.
-        let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
-        normal_sum += tap.weight * vec3<f32>(back, unpacked.z);
-        // A layer with no map of its own holds a filled array layer, so
-        // it is not sampled: it contributes the identity instead,
-        // unoccluded and at full roughness before the slot's own value.
+
+        if has_height {
+            height_sum += tap.weight
+                * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
+        } else {
+            height_sum += tap.weight * FLAT_HEIGHT;
+        }
+        if has_normal {
+            let packed =
+                textureSampleGrad(normal_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
+            let unpacked = packed * 2.0 - 1.0;
+            // This tap's UV was turned by `tap.turn`, so its texture reads
+            // rotated by the inverse across the surface and the tangent-space
+            // normal stored in it has to turn back before the tiles are
+            // blended. Green is already in the shader's convention:
+            // `flip_normal_y` is applied on the way into the array.
+            let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
+            normal_sum += tap.weight * vec3<f32>(back, unpacked.z);
+        } else {
+            normal_sum += tap.weight * vec3<f32>(0.0, 0.0, 1.0);
+        }
         if has_occlusion {
             occlusion_sum += tap.weight * textureSampleGrad(
                 occlusion_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;

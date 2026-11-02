@@ -963,6 +963,10 @@ pub struct TerrainSplatMaterial {
     /// without one takes [`Self::perceptual_roughness`].
     #[uniform(0)]
     pub roughness_slots: u32,
+    #[uniform(0)]
+    pub normal_slots: u32,
+    #[uniform(0)]
+    pub height_slots: u32,
     #[texture(1, dimension = "2d_array")]
     #[sampler(2)]
     pub albedo: Handle<Image>,
@@ -1046,6 +1050,8 @@ impl TerrainSplatMaterial {
             tint_strength: crate::sidecar::DEFAULT_TINT_STRENGTH,
             occlusion_slots: slot_mask(set, |entry| entry.occlusion.is_some()),
             roughness_slots: slot_mask(set, |entry| entry.roughness.is_some()),
+            normal_slots: slot_mask(set, |entry| entry.normal.is_some()),
+            height_slots: slot_mask(set, |entry| entry.height.is_some()),
             albedo: arrays.albedo,
             normal: arrays.normal,
             height: arrays.height,
@@ -2382,6 +2388,14 @@ mod tests {
                     roughness: Some("c_orm.png".to_string()),
                     ..TextureSetEntry::new("sand", "c.png")
                 },
+                TextureSetEntry {
+                    normal: Some("d_n.png".to_string()),
+                    ..TextureSetEntry::new("moss", "d.png")
+                },
+                TextureSetEntry {
+                    height: Some("e_h.png".to_string()),
+                    ..TextureSetEntry::new("dirt", "e.png")
+                },
             ],
         };
         let material = TerrainSplatMaterial::new(
@@ -2404,6 +2418,8 @@ mod tests {
 
         assert_eq!(material.occlusion_slots, 0b010);
         assert_eq!(material.roughness_slots, 0b100);
+        assert_eq!(material.normal_slots, 0b1000);
+        assert_eq!(material.height_slots, 0b10000);
     }
 
     /// The shader source, for the binding checks below.
@@ -2468,6 +2484,8 @@ mod tests {
             "tint_strength: f32",
             "occlusion_slots: u32",
             "roughness_slots: u32",
+            "normal_slots: u32",
+            "height_slots: u32",
         ] {
             let found = body[at..]
                 .find(field)
