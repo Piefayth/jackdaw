@@ -8,7 +8,7 @@ use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::camera::{Exposure, Hdr};
 use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::{GeneratedEnvironmentMapLight, ShadowFilteringMethod};
+use bevy::light::{AmbientLight, GeneratedEnvironmentMapLight, ShadowFilteringMethod};
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::mesh::{MeshVertexBufferLayoutRef, PrimitiveTopology};
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPipeline, MaterialPipelineKey};
@@ -100,6 +100,7 @@ pub struct UndressedCamera {
     vignette: Option<Vignette>,
     fog: Option<DistanceFog>,
     ambient: Option<EnvironmentMapLight>,
+    ambient_light: Option<AmbientLight>,
     hdr: bool,
     fxaa: Option<Fxaa>,
     smaa: Option<Smaa>,
@@ -451,6 +452,7 @@ type CameraParts = (
     Option<&'static Vignette>,
     Option<&'static DistanceFog>,
     Option<&'static EnvironmentMapLight>,
+    Option<&'static AmbientLight>,
     Has<Hdr>,
     (
         Option<&'static Fxaa>,
@@ -474,7 +476,7 @@ fn dress_the_cameras(
 ) {
     let dressing = scene.0.as_ref().filter(|env| env.dresses_cameras());
     let ambient = dressing
-        .filter(|env| env.ambient.mode != AmbientMode::Off)
+        .filter(|env| env.ambient.mode != AmbientMode::Off && !is_flat(&env.ambient))
         .map(|env| {
             if built_ambient.as_ref() != Some(&env.ambient) {
                 images
@@ -496,6 +498,7 @@ fn dress_the_cameras(
         vignette,
         fog,
         light,
+        ambient_light,
         hdr,
         (fxaa, smaa, taa, msaa, filtering, draws_oit, bakes_light, opt_out),
     ) in &cameras
@@ -528,6 +531,7 @@ fn dress_the_cameras(
             vignette: vignette.cloned(),
             fog: fog.cloned(),
             ambient: light.cloned(),
+            ambient_light: ambient_light.cloned(),
             hdr,
             fxaa: fxaa.cloned(),
             smaa: smaa.copied(),
@@ -540,26 +544,44 @@ fn dress_the_cameras(
         } else {
             dress_fog(&mut camera, &env.fog, &undressed);
         }
-        match ambient.as_ref().filter(|_| !left_out.ambient) {
-            Some(map) => {
-                let specular = match env.ambient.reflections {
-                    Reflections::Sky => sky_reflection.0.clone(),
-                    Reflections::Trilight => None,
-                };
-                camera.insert(EnvironmentMapLight {
+        if left_out.ambient || env.ambient.mode == AmbientMode::Off {
+            restore(&mut camera, undressed.ambient.clone());
+            restore(&mut camera, undressed.ambient_light.clone());
+        } else if let Some(map) = &ambient {
+            let specular = match env.ambient.reflections {
+                Reflections::Sky => sky_reflection.0.clone(),
+                Reflections::Trilight => None,
+            };
+            camera.insert((
+                EnvironmentMapLight {
                     diffuse_map: map.clone(),
                     specular_map: specular.unwrap_or_else(|| map.clone()),
                     intensity: env.ambient.brightness,
                     ..default()
-                });
-            }
-            None => restore(&mut camera, undressed.ambient.clone()),
+                },
+                AmbientLight {
+                    brightness: 0.0,
+                    ..default()
+                },
+            ));
+        } else {
+            camera.remove::<EnvironmentMapLight>().insert(AmbientLight {
+                color: env.ambient.color,
+                brightness: env.ambient.brightness,
+                affects_lightmapped_meshes: true,
+            });
         }
         if !bakes_light {
             dress_post(&mut camera, &env.post, &undressed, draws_oit, left_out);
         }
         camera.insert(undressed);
     }
+}
+
+/// One colour from every direction is exactly bevy's own ambient light, which
+/// costs a constant per pixel instead of a cubemap's lookups.
+fn is_flat(ambient: &Ambient) -> bool {
+    ambient.mode == AmbientMode::Flat && ambient.reflections == Reflections::Trilight
 }
 
 fn restore<T: Component>(camera: &mut EntityCommands, kept: Option<T>) {
@@ -577,6 +599,7 @@ impl UndressedCamera {
     fn restore_all(&self, camera: &mut EntityCommands, left_out: EnvironmentOptOut) {
         restore(camera, self.fog.clone());
         restore(camera, self.ambient.clone());
+        restore(camera, self.ambient_light.clone());
         self.restore_post(camera, left_out);
     }
 
@@ -916,6 +939,7 @@ mod tests {
         exposure: Option<f32>,
         fog: bool,
         ambient: bool,
+        ambient_light: bool,
         bloom: bool,
         vignette: bool,
         grading: bool,
@@ -930,6 +954,7 @@ mod tests {
             exposure: camera.get::<Exposure>().map(|exposure| exposure.ev100),
             fog: camera.contains::<DistanceFog>(),
             ambient: camera.contains::<EnvironmentMapLight>(),
+            ambient_light: camera.contains::<AmbientLight>(),
             bloom: camera.contains::<Bloom>(),
             vignette: camera.contains::<Vignette>(),
             grading: camera.contains::<ColorGrading>(),
@@ -1169,7 +1194,7 @@ mod tests {
             &mut app,
             Environment {
                 ambient: Ambient {
-                    mode: AmbientMode::Flat,
+                    mode: AmbientMode::Trilight,
                     ..Ambient::default()
                 },
                 ..Environment::default()
