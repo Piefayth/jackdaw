@@ -327,6 +327,52 @@ fn sample_detiled(tiled: Sampling, slots: LayerSlots) -> LayerSample {
     return sum;
 }
 
+const SIDE_START_COS: f32 = 0.766; // 40 degrees
+const SIDE_END_COS: f32 = 0.574; // 55 degrees
+
+struct Surface {
+    p: vec3<f32>,
+    ddx: vec3<f32>,
+    ddy: vec3<f32>,
+    // 0 on ground flat enough to project from above, 1 on cliffs.
+    steep: f32,
+    faces_x: bool,
+}
+
+// Hash Functions for GPU Rendering https://jcgt.org/published/0009/03/02/
+fn pcg3d(input: vec3<u32>) -> vec3<u32> {
+    var v = input * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> vec3<u32>(16u);
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
+}
+
+fn cell_hash(cell: vec3<i32>) -> f32 {
+    return f32(pcg3d(vec3<u32>(cell)).x >> 8u) / 16777216.0;
+}
+
+fn project(surface: Surface, scale: f32, texels: f32) -> TileTap {
+    let p = surface.p * scale;
+    let dx = surface.ddx * scale;
+    let dy = surface.ddy * scale;
+    let side = cell_hash(vec3<i32>(floor(p * texels))) < surface.steep;
+    if !side {
+        return TileTap(p.xz, dx.xz, dy.xz, vec2<f32>(1.0, 0.0), 1.0);
+    }
+    // texture v runs down, height runs up
+    if surface.faces_x {
+        return TileTap(
+            vec2<f32>(p.z, -p.y), vec2<f32>(dx.z, -dx.y), vec2<f32>(dy.z, -dy.y), vec2<f32>(1.0, 0.0), 1.0);
+    }
+    return TileTap(
+        vec2<f32>(p.x, -p.y), vec2<f32>(dx.x, -dx.y), vec2<f32>(dy.x, -dy.y), vec2<f32>(1.0, 0.0), 1.0);
+}
+
 struct Accum {
     albedo: vec3<f32>,
     normal: vec3<f32>,
@@ -356,9 +402,7 @@ fn accumulate(
     id: u32,
     corner_weights: vec4<f32>,
     layer_weight: f32,
-    local_xz: vec2<f32>,
-    ddx_local: vec2<f32>,
-    ddy_local: vec2<f32>,
+    surface: Surface,
 ) -> Accum {
     let layer_id = min(id, last_layer());
     let layer = i32(layer_id);
@@ -368,16 +412,14 @@ fn accumulate(
     let has_normal = ((splat.normal_slots >> layer_id) & 1u) != 0u;
     let has_height = ((splat.height_slots >> layer_id) & 1u) != 0u;
     let slots = LayerSlots(layer, has_height, has_normal, has_occlusion, has_roughness);
-    let uv = local_xz * scale;
-    let ddx = ddx_local * scale;
-    let ddy = ddy_local * scale;
+    let projected = project(surface, scale, f32(textureDimensions(albedo_array).x));
     let strength = detile_for(layer_id);
 
     var sampled: LayerSample;
     if strength <= 0.0 {
-        sampled = sample_tap(TileTap(uv, ddx, ddy, vec2<f32>(1.0, 0.0), 1.0), slots);
+        sampled = sample_tap(projected, slots);
     } else {
-        sampled = sample_detiled(detile(uv, ddx, ddy, strength), slots);
+        sampled = sample_detiled(detile(projected.uv, projected.ddx, projected.ddy, strength), slots);
     }
 
     let own_roughness = slot_value(splat.slot_roughness, layer_id);
@@ -422,9 +464,7 @@ fn accumulate_control(
     accum: Accum,
     control: u32,
     corner_weights: vec4<f32>,
-    local_xz: vec2<f32>,
-    ddx_local: vec2<f32>,
-    ddy_local: vec2<f32>,
+    surface: Surface,
 ) -> Accum {
     let base_id = (control >> BASE_SHIFT) & BASE_MASK;
     let overlay_id = (control >> OVERLAY_SHIFT) & OVERLAY_MASK;
@@ -433,11 +473,11 @@ fn accumulate_control(
     var out = accum;
     if blend < 1.0 {
         out = accumulate(
-            out, base_id, corner_weights, 1.0 - blend, local_xz, ddx_local, ddy_local);
+            out, base_id, corner_weights, 1.0 - blend, surface);
     }
     if blend >= 1.0 || (blend > 0.0 && overlay_id != base_id) {
         out = accumulate(
-            out, overlay_id, corner_weights, blend, local_xz, ddx_local, ddy_local);
+            out, overlay_id, corner_weights, blend, surface);
     }
     return out;
 }
@@ -465,8 +505,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // that meet on a grid line, which is what keeps the control lookup
     // seamless across a chunk join.
     let local_xz = (in.uv - vec2<f32>(0.5)) * splat.terrain_size;
-    let ddx_local = dpdx(local_xz);
-    let ddy_local = dpdy(local_xz);
+    let p = vec3<f32>(local_xz.x, in.world_position.y, local_xz.y);
+    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
+    let n = normalize(world_normal);
+    var surface: Surface;
+    surface.p = p;
+    surface.ddx = dpdx(p);
+    surface.ddy = dpdy(p);
+    surface.steep = saturate((SIDE_START_COS - n.y) / (SIDE_START_COS - SIDE_END_COS));
+    surface.faces_x = abs(n.x) > abs(n.z);
 
     // The tint is sampled, not loaded: it is a colour, so two of them interpolate
     // into a colour. Taken here, with the derivatives, because the per-layer
@@ -522,16 +569,16 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         // area: one control word, so four taps would sample the same textures
         // four times. Passing all four corner weights to one call sums the same
         // four terms the branch below sums separately.
-        accum = accumulate_control(accum, c00, w, local_xz, ddx_local, ddy_local);
+        accum = accumulate_control(accum, c00, w, surface);
     } else {
         accum = accumulate_control(
-            accum, c00, vec4<f32>(w.x, 0.0, 0.0, 0.0), local_xz, ddx_local, ddy_local);
+            accum, c00, vec4<f32>(w.x, 0.0, 0.0, 0.0), surface);
         accum = accumulate_control(
-            accum, c10, vec4<f32>(0.0, w.y, 0.0, 0.0), local_xz, ddx_local, ddy_local);
+            accum, c10, vec4<f32>(0.0, w.y, 0.0, 0.0), surface);
         accum = accumulate_control(
-            accum, c01, vec4<f32>(0.0, 0.0, w.z, 0.0), local_xz, ddx_local, ddy_local);
+            accum, c01, vec4<f32>(0.0, 0.0, w.z, 0.0), surface);
         accum = accumulate_control(
-            accum, c11, vec4<f32>(0.0, 0.0, 0.0, w.w), local_xz, ddx_local, ddy_local);
+            accum, c11, vec4<f32>(0.0, 0.0, 0.0, w.w), surface);
     }
 
     let inv_total = 1.0 / max(accum.total, 1e-8);
@@ -546,8 +593,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // where the surface stands vertical and faces X, so +Z stands in there.
     // Picking the axis the normal leans on least would swap the frame by 90
     // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
-    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
-    let n = normalize(world_normal);
     var reference = vec3<f32>(1.0, 0.0, 0.0);
     if abs(n.x) > 0.999 {
         reference = vec3<f32>(0.0, 0.0, 1.0);
