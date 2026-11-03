@@ -54,7 +54,7 @@ pub const MAX_LEVELS: u32 = 8;
 
 /// How coarse the outermost level may get before another level is worth
 /// having: quads per side of the whole terrain.
-const COARSE_BUDGET: u32 = RING_CELLS * 2;
+const COARSE_BUDGET: u32 = RING_CELLS * 4;
 
 /// One LOD level: a square of quads at one step, minus the square the
 /// finer level covers.

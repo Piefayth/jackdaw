@@ -975,6 +975,7 @@ pub struct TerrainSplatMaterial {
     #[texture(4, dimension = "2d_array")]
     pub height: Handle<Image>,
     #[texture(5, sample_type = "u_int")]
+    #[sampler(11, sampler_type = "non_filtering")] // hack for us
     pub control: Handle<Image>,
     /// Slope per grid point, in radians. Only autoterrain reads it.
     #[texture(6, sample_type = "float", filterable = false)]

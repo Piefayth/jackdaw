@@ -102,6 +102,7 @@ struct SplatUniform {
 @group(constants::MATERIAL_BIND_GROUP) @binding(8) var tint_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(9) var occlusion_array: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(10) var roughness_array: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(11) var point_sampler: sampler;
 
 // The last id this material can address: one short of the bound set's
 // layer count, and never past the UV-scale array. Every id is clamped
@@ -233,16 +234,8 @@ fn control_corner(g: vec2<f32>) -> vec2<i32> {
     return clamp(vec2<i32>(floor(g)), vec2<i32>(0), vec2<i32>(last));
 }
 
-fn load_control(coord: vec2<i32>) -> u32 {
-    let last = i32(max(splat.control_resolution, 1u) - 1u);
-    let clamped = clamp(coord, vec2<i32>(0), vec2<i32>(last));
-    return textureLoad(control_map, clamped, 0).r;
-}
-
-fn load_slope(coord: vec2<i32>) -> f32 {
-    let last = vec2<i32>(textureDimensions(slope_map)) - vec2<i32>(1);
-    let clamped = clamp(coord, vec2<i32>(0), max(last, vec2<i32>(0)));
-    return textureLoad(slope_map, clamped, 0).r;
+fn gather_uv(corner: vec2<i32>, size: vec2<u32>) -> vec2<f32> {
+    return (vec2<f32>(corner) + 1.0) / vec2<f32>(size);
 }
 
 // The stored slope under a fragment, bilinear across the four grid points around
@@ -254,11 +247,84 @@ fn load_slope(coord: vec2<i32>) -> f32 {
 // flat or steep, which keeps the single-word fast path below covering most of a
 // terrain.
 fn slope_at(corner: vec2<i32>, f: vec2<f32>) -> f32 {
-    let s00 = load_slope(corner);
-    let s10 = load_slope(corner + vec2<i32>(1, 0));
-    let s01 = load_slope(corner + vec2<i32>(0, 1));
-    let s11 = load_slope(corner + vec2<i32>(1, 1));
-    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+    // x = (0, 1), y = (1, 1), z = (1, 0), w = (0, 0)
+    let s = textureGather(0, slope_map, point_sampler, gather_uv(corner, textureDimensions(slope_map)));
+    return mix(mix(s.w, s.z, f.x), mix(s.x, s.y, f.x), f.y);
+}
+
+struct LayerSlots {
+    layer: i32,
+    has_height: bool,
+    has_normal: bool,
+    has_occlusion: bool,
+    has_roughness: bool,
+}
+
+struct LayerSample {
+    albedo: vec3<f32>,
+    height: f32,
+    normal: vec3<f32>,
+    occlusion: f32,
+    roughness: f32,
+}
+
+fn sample_tap(tap: TileTap, slots: LayerSlots) -> LayerSample {
+    let layer_size = vec2<f32>(textureDimensions(albedo_array));
+    let uv = texel_sharp(tap.uv, tap.ddx, tap.ddy, layer_size);
+    var out: LayerSample;
+    out.albedo = textureSampleGrad(albedo_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).rgb;
+    out.height = FLAT_HEIGHT;
+    if slots.has_height {
+        out.height = textureSampleGrad(height_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).r;
+    }
+    out.normal = vec3<f32>(0.0, 0.0, 1.0);
+    if slots.has_normal {
+        let packed = textureSampleGrad(normal_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).rgb;
+        let unpacked = packed * 2.0 - 1.0;
+        let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
+        out.normal = vec3<f32>(back, unpacked.z);
+    }
+    out.occlusion = 1.0;
+    if slots.has_occlusion {
+        out.occlusion = textureSampleGrad(
+            occlusion_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).r;
+    }
+    out.roughness = 1.0;
+    if slots.has_roughness {
+        out.roughness = textureSampleGrad(
+            roughness_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).g;
+    }
+    return out;
+}
+
+fn sample_detiled(tiled: Sampling, slots: LayerSlots) -> LayerSample {
+    var sum: LayerSample;
+    sum.albedo = vec3<f32>(0.0);
+    sum.height = 0.0;
+    sum.normal = vec3<f32>(0.0);
+    sum.occlusion = 0.0;
+    sum.roughness = 0.0;
+    var taken = 0.0;
+    for (var t = 0u; t < tiled.count; t++) {
+        let tap = tiled.taps[t];
+        if tap.weight <= 1e-4 {
+            continue;
+        }
+        let one = sample_tap(tap, slots);
+        sum.albedo += tap.weight * one.albedo;
+        sum.height += tap.weight * one.height;
+        sum.normal += tap.weight * one.normal;
+        sum.occlusion += tap.weight * one.occlusion;
+        sum.roughness += tap.weight * one.roughness;
+        taken += tap.weight;
+    }
+    let inv = 1.0 / max(taken, 1e-8);
+    sum.albedo *= inv;
+    sum.height *= inv;
+    sum.normal *= inv;
+    sum.occlusion *= inv;
+    sum.roughness *= inv;
+    return sum;
 }
 
 struct Accum {
@@ -297,70 +363,23 @@ fn accumulate(
     let layer_id = min(id, last_layer());
     let layer = i32(layer_id);
     let scale = uv_scale_for(layer_id);
-    let tiled = detile(
-        local_xz * scale, ddx_local * scale, ddy_local * scale, detile_for(layer_id));
-
-    // One sample per tile, blended after sampling: a rigid UV and its own
-    // derivatives per tap, so no tap is stretched by its neighbours.
-    // Four taps of three arrays across four control corners is 96 reads
-    // per fragment where a single cell with detiling off takes 24.
-    var albedo_sum = vec3<f32>(0.0);
-    var height_sum = 0.0;
-    var normal_sum = vec3<f32>(0.0);
-    var occlusion_sum = 0.0;
-    var roughness_sum = 0.0;
-    var taken = 0.0;
     let has_occlusion = ((splat.occlusion_slots >> layer_id) & 1u) != 0u;
     let has_roughness = ((splat.roughness_slots >> layer_id) & 1u) != 0u;
     let has_normal = ((splat.normal_slots >> layer_id) & 1u) != 0u;
     let has_height = ((splat.height_slots >> layer_id) & 1u) != 0u;
-    let layer_size = vec2<f32>(textureDimensions(albedo_array));
-    for (var t = 0u; t < tiled.count; t++) {
-        var tap = tiled.taps[t];
-        tap.uv = texel_sharp(tap.uv, tap.ddx, tap.ddy, layer_size);
-        // A tile whose share has fallen to nothing is three samples that
-        // change no pixel. The gradients are explicit, so this branch does
-        // not have to be uniform.
-        if tap.weight <= 1e-4 {
-            continue;
-        }
-        albedo_sum += tap.weight
-            * textureSampleGrad(albedo_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
+    let slots = LayerSlots(layer, has_height, has_normal, has_occlusion, has_roughness);
+    let uv = local_xz * scale;
+    let ddx = ddx_local * scale;
+    let ddy = ddy_local * scale;
+    let strength = detile_for(layer_id);
 
-        if has_height {
-            height_sum += tap.weight
-                * textureSampleGrad(height_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
-        } else {
-            height_sum += tap.weight * FLAT_HEIGHT;
-        }
-        if has_normal {
-            let packed =
-                textureSampleGrad(normal_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).rgb;
-            let unpacked = packed * 2.0 - 1.0;
-            // This tap's UV was turned by `tap.turn`, so its texture reads
-            // rotated by the inverse across the surface and the tangent-space
-            // normal stored in it has to turn back before the tiles are
-            // blended. Green is already in the shader's convention:
-            // `flip_normal_y` is applied on the way into the array.
-            let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
-            normal_sum += tap.weight * vec3<f32>(back, unpacked.z);
-        } else {
-            normal_sum += tap.weight * vec3<f32>(0.0, 0.0, 1.0);
-        }
-        if has_occlusion {
-            occlusion_sum += tap.weight * textureSampleGrad(
-                occlusion_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).r;
-        } else {
-            occlusion_sum += tap.weight;
-        }
-        if has_roughness {
-            roughness_sum += tap.weight * textureSampleGrad(
-                roughness_array, layer_sampler, tap.uv, layer, tap.ddx, tap.ddy).g;
-        } else {
-            roughness_sum += tap.weight;
-        }
-        taken += tap.weight;
+    var sampled: LayerSample;
+    if strength <= 0.0 {
+        sampled = sample_tap(TileTap(uv, ddx, ddy, vec2<f32>(1.0, 0.0), 1.0), slots);
+    } else {
+        sampled = sample_detiled(detile(uv, ddx, ddy, strength), slots);
     }
+
     let own_roughness = slot_value(splat.slot_roughness, layer_id);
     var roughness_scale = 1.0;
     if own_roughness >= 0.0 {
@@ -370,12 +389,11 @@ fn accumulate(
     }
     let own_reflectance = slot_value(splat.slot_reflectance, layer_id);
     let reflectance = select(DEFAULT_REFLECTANCE, own_reflectance, own_reflectance >= 0.0);
-    let inv_taps = 1.0 / max(taken, 1e-8);
-    let albedo = albedo_sum * inv_taps;
-    let height = height_sum * inv_taps;
-    let normal = normal_sum * inv_taps;
-    let occlusion = occlusion_sum * inv_taps;
-    let roughness = min(roughness_sum * inv_taps * roughness_scale, 1.0);
+    let albedo = sampled.albedo;
+    let height = sampled.height;
+    let normal = sampled.normal;
+    let occlusion = sampled.occlusion;
+    let roughness = min(sampled.roughness * roughness_scale, 1.0);
 
     let sharpness = SHARPNESS_MIN + SHARPNESS_RANGE * splat.blend_sharpness;
     let contested = vec4<f32>(layer_weight + height);
@@ -460,16 +478,21 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // `render::tint_uv` spells the same mapping in Rust.
     let tint_res = f32(max(splat.control_resolution, 2u));
     let tint_uv = (in.uv * (tint_res - 1.0) + 0.5) / tint_res;
-    let tint = textureSample(tint_map, tint_sampler, tint_uv).rgb;
+    var tint = vec3<f32>(1.0);
+    if splat.tint_strength > 0.0 {
+        tint = textureSample(tint_map, tint_sampler, tint_uv).rgb;
+    }
 
     let g = in.uv * f32(max(splat.control_resolution, 2u) - 1u);
     let corner = control_corner(g);
     let f = clamp(g - vec2<f32>(corner), vec2<f32>(0.0), vec2<f32>(1.0));
 
-    var c00 = load_control(corner);
-    var c10 = load_control(corner + vec2<i32>(1, 0));
-    var c01 = load_control(corner + vec2<i32>(0, 1));
-    var c11 = load_control(corner + vec2<i32>(1, 1));
+    // gather order: x = (0, 1), y = (1, 1), z = (1, 0), w = (0, 0)
+    let words = textureGather(0, control_map, point_sampler, gather_uv(corner, textureDimensions(control_map)));
+    var c00 = words.w;
+    var c10 = words.z;
+    var c01 = words.x;
+    var c11 = words.y;
 
     // A terrain with autoterrain off never reaches this, and a cell a
     // hand claimed keeps the word it was painted with. Everything
