@@ -24,11 +24,6 @@ import bevy_pbr::render::{
     pbr_types,
 };
 
-// The remap of a 0..1 authoring dial onto a power exponent. 4 is a wide,
-// soft cross-fade; 64 is a near-binary height cutout.
-const SHARPNESS_MIN: f32 = 4.0;
-const SHARPNESS_RANGE: f32 = 60.0;
-
 const BASE_SHIFT: u32 = 0u;
 const BASE_MASK: u32 = 0x1Fu;
 const OVERLAY_SHIFT: u32 = 5u;
@@ -373,113 +368,70 @@ fn project(surface: Surface, scale: f32, texels: f32) -> TileTap {
         vec2<f32>(p.x, -p.y), vec2<f32>(dx.x, -dx.y), vec2<f32>(dy.x, -dy.y), vec2<f32>(1.0, 0.0), 1.0);
 }
 
-struct Accum {
-    albedo: vec3<f32>,
-    normal: vec3<f32>,
-    occlusion: f32,
-    roughness: f32,
-    reflectance: f32,
-    total: f32,
-}
-
-// One texture id's contribution, summed over the corners that named it.
-//
-// `corner_weights` holds the four bilinear corner shares, with zero in the slots
-// that did not name this id at this layer weight. The weight is
-//
-//     sum over corners of pow(corner_w + layer_w + height, sharpness) * corner_w
-//
-// which is the height-blend curve. `corner_w` rides inside the power so a near
-// corner gets a height advantage, and multiplies outside it so a far corner
-// cannot win on height alone.
-//
-// Taking the four corners as a vector rather than one call per corner is what
-// makes the uniform-word fast path in `fragment` exact: a zeroed slot contributes
-// `pow(k, s) * 0`, so summing the slots here is identical to summing four
-// separate calls.
-fn accumulate(
-    accum: Accum,
-    id: u32,
-    corner_weights: vec4<f32>,
-    layer_weight: f32,
-    surface: Surface,
-) -> Accum {
-    let layer_id = min(id, last_layer());
-    let layer = i32(layer_id);
-    let scale = uv_scale_for(layer_id);
-    let has_occlusion = ((splat.occlusion_slots >> layer_id) & 1u) != 0u;
-    let has_roughness = ((splat.roughness_slots >> layer_id) & 1u) != 0u;
-    let has_normal = ((splat.normal_slots >> layer_id) & 1u) != 0u;
-    let has_height = ((splat.height_slots >> layer_id) & 1u) != 0u;
-    let slots = LayerSlots(layer, has_height, has_normal, has_occlusion, has_roughness);
-    let projected = project(surface, scale, f32(textureDimensions(albedo_array).x));
+fn sample_layer(layer_id: u32, surface: Surface) -> LayerSample {
+    let slots = LayerSlots(
+        i32(layer_id),
+        ((splat.height_slots >> layer_id) & 1u) != 0u,
+        ((splat.normal_slots >> layer_id) & 1u) != 0u,
+        ((splat.occlusion_slots >> layer_id) & 1u) != 0u,
+        ((splat.roughness_slots >> layer_id) & 1u) != 0u,
+    );
+    let projected = project(surface, uv_scale_for(layer_id), f32(textureDimensions(albedo_array).x));
     let strength = detile_for(layer_id);
-
-    var sampled: LayerSample;
     if strength <= 0.0 {
-        sampled = sample_tap(projected, slots);
-    } else {
-        sampled = sample_detiled(detile(projected.uv, projected.ddx, projected.ddy, strength), slots);
+        return sample_tap(projected, slots);
     }
-
-    let own_roughness = slot_value(splat.slot_roughness, layer_id);
-    var roughness_scale = 1.0;
-    if own_roughness >= 0.0 {
-        roughness_scale = own_roughness;
-    } else if !has_roughness {
-        roughness_scale = splat.perceptual_roughness;
-    }
-    let own_reflectance = slot_value(splat.slot_reflectance, layer_id);
-    let reflectance = select(DEFAULT_REFLECTANCE, own_reflectance, own_reflectance >= 0.0);
-    let albedo = sampled.albedo;
-    let height = sampled.height;
-    let normal = sampled.normal;
-    let occlusion = sampled.occlusion;
-    let roughness = min(sampled.roughness * roughness_scale, 1.0);
-
-    let sharpness = SHARPNESS_MIN + SHARPNESS_RANGE * splat.blend_sharpness;
-    let contested = vec4<f32>(layer_weight + height);
-    let weight = dot(pow(corner_weights + contested, vec4<f32>(sharpness)), corner_weights);
-
-    var out = accum;
-    out.albedo += albedo * weight;
-    out.normal += normal * weight;
-    out.occlusion += occlusion * weight;
-    out.roughness += roughness * weight;
-    out.reflectance += reflectance * weight;
-    out.total += weight;
-    return out;
+    return sample_detiled(detile(projected.uv, projected.ddx, projected.ddy, strength), slots);
 }
 
-// Both of a control word's layers.
-//
-// The two guards must between them cover every word, or a fragment
-// accumulates nothing and normalizes zero by zero. `blend < 1.0` covers
-// the base for every blend but full overlay; the overlay covers the rest.
-// The `overlay_id != base_id` skip is an optimization, blending a texture
-// with itself being that texture, so it must not apply at full overlay,
-// where the base has already been skipped. A word naming the same id twice
-// at blend 255 is the case that would otherwise fall through both.
-fn accumulate_control(
-    accum: Accum,
-    control: u32,
-    corner_weights: vec4<f32>,
-    surface: Surface,
-) -> Accum {
-    let base_id = (control >> BASE_SHIFT) & BASE_MASK;
-    let overlay_id = (control >> OVERLAY_SHIFT) & OVERLAY_MASK;
-    let blend = f32((control >> BLEND_SHIFT) & BLEND_MASK) / 255.0;
+struct Accum {
+    base_ids: vec4<u32>,
+    base_weights: vec4<f32>,
+    overlay_ids: vec4<u32>,
+    overlay_weights: vec4<f32>,
+}
 
-    var out = accum;
-    if blend < 1.0 {
-        out = accumulate(
-            out, base_id, corner_weights, 1.0 - blend, surface);
+// you have a 4 texture mask like (0, 0, 1, 1)
+// with a weighting like (0.4, 0.2, 0.1, 0.3)
+// the share_below(1) is the mask (1, 1, 0, 0) i.e. (true true false false)
+// sum the matching weights 0.4 + 0.2 = 0.6
+fn share_below(accum: Accum, id: u32) -> f32 {
+    let one = vec4<f32>(1.0);
+    let zero = vec4<f32>(0.0);
+    return dot(accum.base_weights, select(zero, one, accum.base_ids < vec4<u32>(id)))
+        + dot(accum.overlay_weights, select(zero, one, accum.overlay_ids < vec4<u32>(id)));
+}
+
+// same as share below but with the inverse masking rule
+fn share_of(accum: Accum, id: u32) -> f32 {
+    let one = vec4<f32>(1.0);
+    let zero = vec4<f32>(0.0);
+    return dot(accum.base_weights, select(zero, one, accum.base_ids == vec4<u32>(id)))
+        + dot(accum.overlay_weights, select(zero, one, accum.overlay_ids == vec4<u32>(id)));
+}
+
+fn dithered_layer(accum: Accum, threshold: f32) -> u32 {
+    let level = threshold * (dot(accum.base_weights, vec4<f32>(1.0)) + dot(accum.overlay_weights, vec4<f32>(1.0)));
+    var chosen = accum.base_ids.x;
+    for (var k = 0u; k < 4u; k++) {
+        let base = share_below(accum, accum.base_ids[k]);
+        if base <= level && level < base + share_of(accum, accum.base_ids[k]) {
+            chosen = accum.base_ids[k];
+        }
+        let overlay = share_below(accum, accum.overlay_ids[k]);
+        if overlay <= level && level < overlay + share_of(accum, accum.overlay_ids[k]) {
+            chosen = accum.overlay_ids[k];
+        }
     }
-    if blend >= 1.0 || (blend > 0.0 && overlay_id != base_id) {
-        out = accumulate(
-            out, overlay_id, corner_weights, blend, surface);
-    }
-    return out;
+    return chosen;
+}
+
+
+fn bayer(cell: vec2<u32>) -> f32 {
+    let lo = cell & vec2<u32>(1u);
+    let hi = (cell >> vec2<u32>(1u)) & vec2<u32>(1u);
+    let rank = 4u * (((lo.x ^ lo.y) << 1u) | lo.y) + (((hi.x ^ hi.y) << 1u) | hi.y);
+    return (f32(rank) + 0.5) / 16.0;
 }
 
 // The control word a cell's own slope stands for.
@@ -530,7 +482,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         tint = textureSample(tint_map, tint_sampler, tint_uv).rgb;
     }
 
-    let g = in.uv * f32(max(splat.control_resolution, 2u) - 1u);
+    // manipulate uvs to be whole texels
+    var finest = 0.0;
+    for (var i = 0u; i <= last_layer(); i++) {
+        finest = max(finest, uv_scale_for(i));
+    }
+    let texel = 1.0 / (finest * f32(textureDimensions(albedo_array).x));
+    let texel_cell = vec2<i32>(floor(local_xz / texel));
+    let texel_uv = (vec2<f32>(texel_cell) + 0.5) * texel / splat.terrain_size + vec2<f32>(0.5);
+    let g = texel_uv * f32(max(splat.control_resolution, 2u) - 1u);
     let corner = control_corner(g);
     let f = clamp(g - vec2<f32>(corner), vec2<f32>(0.0), vec2<f32>(1.0));
 
@@ -556,37 +516,44 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let inv = vec2<f32>(1.0) - f;
     let w = vec4<f32>(inv.x * inv.y, f.x * inv.y, inv.x * f.y, f.x * f.y);
 
+    // each texel has a certain share of each texture
+    // the dither is calculated based on that share
+    let corner_words = vec4<u32>(c00, c10, c01, c11);
     var accum: Accum;
-    accum.albedo = vec3<f32>(0.0);
-    accum.normal = vec3<f32>(0.0);
-    accum.occlusion = 0.0;
-    accum.roughness = 0.0;
-    accum.reflectance = 0.0;
-    accum.total = 0.0;
-
-    if c00 == c10 && c00 == c01 && c00 == c11 {
-        // Every unpainted fragment, and the interior of every uniformly painted
-        // area: one control word, so four taps would sample the same textures
-        // four times. Passing all four corner weights to one call sums the same
-        // four terms the branch below sums separately.
-        accum = accumulate_control(accum, c00, w, surface);
-    } else {
-        accum = accumulate_control(
-            accum, c00, vec4<f32>(w.x, 0.0, 0.0, 0.0), surface);
-        accum = accumulate_control(
-            accum, c10, vec4<f32>(0.0, w.y, 0.0, 0.0), surface);
-        accum = accumulate_control(
-            accum, c01, vec4<f32>(0.0, 0.0, w.z, 0.0), surface);
-        accum = accumulate_control(
-            accum, c11, vec4<f32>(0.0, 0.0, 0.0, w.w), surface);
+    for (var k = 0u; k < 4u; k++) {
+        let control = corner_words[k];
+        let base_id = min((control >> BASE_SHIFT) & BASE_MASK, last_layer());
+        let overlay_id = min((control >> OVERLAY_SHIFT) & OVERLAY_MASK, last_layer());
+        let blend = f32((control >> BLEND_SHIFT) & BLEND_MASK) / 255.0;
+        accum.base_ids[k] = base_id;
+        accum.overlay_ids[k] = overlay_id;
+        accum.base_weights[k] = 0.0;
+        accum.overlay_weights[k] = 0.0;
+        if blend < 1.0 {
+            accum.base_weights[k] = w[k] * (1.0 - blend);
+        }
+        if blend > 0.0 {
+            accum.overlay_weights[k] = w[k] * blend;
+        }
     }
 
-    let inv_total = 1.0 / max(accum.total, 1e-8);
-    let albedo = accum.albedo * inv_total * mix(vec3<f32>(1.0), tint, splat.tint_strength);
-    let tangent_normal = accum.normal * inv_total;
-    let occlusion = accum.occlusion * inv_total;
-    let roughness = accum.roughness * inv_total;
-    let reflectance = accum.reflectance * inv_total;
+    // "pick" what texture this texel will be based on the shares above
+    // the second argument is the threshold to use and bayer is what gives us that dither pattern
+    let layer_id = dithered_layer(accum, bayer(vec2<u32>(texel_cell & vec2<i32>(3))));
+    let sampled = sample_layer(layer_id, surface);
+    let own_roughness = slot_value(splat.slot_roughness, layer_id);
+    var roughness_scale = 1.0;
+    if own_roughness >= 0.0 {
+        roughness_scale = own_roughness;
+    } else if ((splat.roughness_slots >> layer_id) & 1u) == 0u {
+        roughness_scale = splat.perceptual_roughness;
+    }
+    let own_reflectance = slot_value(splat.slot_reflectance, layer_id);
+    let albedo = sampled.albedo * mix(vec3<f32>(1.0), tint, splat.tint_strength);
+    let tangent_normal = sampled.normal;
+    let occlusion = sampled.occlusion;
+    let roughness = min(sampled.roughness * roughness_scale, 1.0);
+    let reflectance = select(DEFAULT_REFLECTANCE, own_reflectance, own_reflectance >= 0.0);
 
     // The mesher emits no tangents: UV0 runs along world X and Z, so the tangent
     // is world +X projected onto the surface normal. That projection collapses
