@@ -146,6 +146,10 @@ struct TerrainSplat {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct TerrainViewer;
 
+// hacking around jackdaws lack of terrain readiness indicator
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct TerrainReady;
+
 /// One LOD level of a terrain's surface, rebuilt as the camera moves.
 #[derive(Component)]
 struct TerrainSurface {
@@ -687,6 +691,15 @@ fn sync_surfaces(
                         .insert(MeshMaterial3d(fallback.clone()));
                 }
             }
+        }
+
+        // our definition of ready just includes what we use
+        let resolved = splat.slots == document.data.materials;
+        let settled = splat.set.is_empty() || splat.material.is_some() || splat.reported;
+        if resolved && settled {
+            commands.entity(terrain_entity).insert(TerrainReady);
+        } else {
+            commands.entity(terrain_entity).remove::<TerrainReady>();
         }
     }
 }

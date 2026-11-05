@@ -138,7 +138,7 @@ mod terrain;
 #[cfg(feature = "terrain")]
 pub use jackdaw_terrain::render::{DetailPressers, DetailSettings, DetailViewer};
 #[cfg(feature = "terrain")]
-pub use terrain::{TerrainHeights, TerrainViewer};
+pub use terrain::{TerrainHeights, TerrainReady, TerrainViewer};
 
 #[cfg(feature = "navmesh")]
 mod navmesh;
@@ -166,7 +166,7 @@ pub mod prelude {
         JackdawSceneRoot, ReflectBsnAsset, SceneRefused, SkipSerialization,
     };
     #[cfg(feature = "terrain")]
-    pub use crate::{DetailPressers, DetailSettings, DetailViewer, TerrainViewer};
+    pub use crate::{DetailPressers, DetailSettings, DetailViewer, TerrainReady, TerrainViewer};
 }
 
 /// Marks the transform trees of entities spawned into a freed entity index as changed, which
