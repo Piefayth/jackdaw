@@ -538,8 +538,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
 
     // "pick" what texture this texel will be based on the shares above
-    // the second argument is the threshold to use and bayer is what gives us that dither pattern
-    let layer_id = dithered_layer(accum, bayer(vec2<u32>(texel_cell & vec2<i32>(3))));
+    // the second argument is the threshold to use and bayer is what gives us that dither pattern.
+    let along_side = select(vec2<f32>(p.x, -p.y), vec2<f32>(p.z, -p.y), surface.faces_x);
+    let dither_at = select(local_xz, along_side, surface.steep >= 0.5);
+    let dither_cell = vec2<i32>(floor(dither_at / texel));
+    let layer_id = dithered_layer(accum, bayer(vec2<u32>(dither_cell & vec2<i32>(3))));
     let sampled = sample_layer(layer_id, surface);
     let own_roughness = slot_value(splat.slot_roughness, layer_id);
     var roughness_scale = 1.0;
