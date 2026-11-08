@@ -866,12 +866,16 @@ pub fn tint_image(colors: &[[u8; 4]], resolution: u32) -> Image {
 /// as a level hands over. These values are the same from every distance.
 pub fn slope_image(map: &Heightmap) -> Image {
     let side = map.resolution.max(1);
-    let slopes = map.slope_field();
-    let mut data = Vec::with_capacity((side as usize) * (side as usize) * 4);
-    for texel in &slopes {
-        data.extend_from_slice(&texel.to_le_bytes());
+    let gradients = map.gradient_field();
+    let mut data = Vec::with_capacity((side as usize) * (side as usize) * 16);
+    for gradient in &gradients {
+        let slope = gradient.length().atan();
+        let normal = Vec3::new(-gradient.x, 1.0, -gradient.y).normalize();
+        for value in [slope, normal.x, normal.z, 0.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
     }
-    data.resize((side as usize) * (side as usize) * 4, 0);
+    data.resize((side as usize) * (side as usize) * 16, 0);
     let mut image = Image::new(
         Extent3d {
             width: side,
@@ -880,11 +884,11 @@ pub fn slope_image(map: &Heightmap) -> Image {
         },
         TextureDimension::D2,
         data,
-        TextureFormat::R32Float,
+        TextureFormat::Rgba32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    // `textureLoad` ignores the sampler, but wgpu still validates one
-    // against the format, and `R32Float` is unfilterable.
+    // `textureGather` filters nothing, but wgpu still validates the sampler
+    // against the format, and `Rgba32Float` is unfilterable.
     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         mag_filter: ImageFilterMode::Nearest,
         min_filter: ImageFilterMode::Nearest,

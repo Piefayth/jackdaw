@@ -157,20 +157,20 @@ impl Heightmap {
         (self.resolution >= 2).then(|| self.resolution - 1)
     }
 
-    /// Ground slope at every grid point, in radians, row-major over the
-    /// grid.
+    /// How the ground rises at every grid point, as height per unit of x and
+    /// of z, row-major over the grid.
     ///
     /// Central differences across one cell of the stored grid: the finest
-    /// slope the map holds, and independent of how coarsely a later
+    /// gradient the map holds, and independent of how coarsely a later
     /// sampler steps. A surface meshed at a wider step reads a gentler
     /// angle, and a different one per step size.
     ///
     /// An edge point differences against itself on the missing side and
     /// divides by the one cell it spans, so a constant ramp reads the same
-    /// angle along its border as in its middle.
-    pub fn slope_field(&self) -> Vec<f32> {
+    /// gradient along its border as in its middle.
+    pub fn gradient_field(&self) -> Vec<Vec2> {
         let res = self.resolution;
-        let mut out = vec![0.0; (res as usize) * (res as usize)];
+        let mut out = vec![Vec2::ZERO; (res as usize) * (res as usize)];
         let Some(last) = res.checked_sub(1).filter(|_| res >= 2) else {
             return out;
         };
@@ -185,11 +185,22 @@ impl Heightmap {
                     / ((high_x - low_x) as f32 * cell.x);
                 let dz = (self.get_height(x, high_z) - self.get_height(x, low_z))
                     / ((high_z - low_z) as f32 * cell.y);
-                let slope = (dx * dx + dz * dz).sqrt().atan();
-                out[(z * res + x) as usize] = if slope.is_finite() { slope } else { 0.0 };
+                let gradient = Vec2::new(dx, dz);
+                out[(z * res + x) as usize] = if gradient.is_finite() {
+                    gradient
+                } else {
+                    Vec2::ZERO
+                };
             }
         }
         out
+    }
+
+    pub fn slope_field(&self) -> Vec<f32> {
+        self.gradient_field()
+            .into_iter()
+            .map(|gradient| gradient.length().atan())
+            .collect()
     }
 
     /// Lowest and highest stored height. `(0.0, 0.0)` when there are no

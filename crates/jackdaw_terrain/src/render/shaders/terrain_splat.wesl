@@ -6,23 +6,33 @@
 // are read per fragment and their decoded contributions are mixed with bilinear
 // weights.
 //
-// A terrain with autoterrain on replaces the word of every cell no hand has
-// claimed with one its own slope stands for. That slope comes from `slope_map`,
-// which holds the ground's own slope per grid point, and never from the surface
-// being drawn: the surface is a clipmap, so a slope taken from the mesh normal
-// reads gentler with distance.
 //
 // Every texture read is `textureSampleGrad` with derivatives taken once in
 // uniform control flow at the top of `fragment`: the per-layer branches below
 // make implicit-derivative sampling illegal.
 
 import bevy_pbr::render::{
+    clustered_forward as clustering,
     forward_io::{VertexOutput, FragmentOutput},
     mesh_bindings::mesh,
-    mesh_view_bindings::view,
+    mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
+    mesh_view_bindings::{clustered_lights, lights, view},
+    mesh_view_types::{
+        DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+        POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+        POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+    },
     pbr_functions,
+    pbr_lighting::getDistanceAttenuation,
     pbr_types,
+    shadows,
 };
+import bevy_render::maths::{PI, quat_rotate};
+@if(ENVIRONMENT_MAP) import bevy_pbr::render::mesh_view_bindings::{environment_map_sampler, light_probes};
+@if(ENVIRONMENT_MAP && MULTIPLE_LIGHT_PROBES_IN_ARRAY)
+import bevy_pbr::render::mesh_view_bindings::diffuse_environment_maps;
+@if(ENVIRONMENT_MAP && !MULTIPLE_LIGHT_PROBES_IN_ARRAY)
+import bevy_pbr::render::mesh_view_bindings::diffuse_environment_map;
 
 const BASE_SHIFT: u32 = 0u;
 const BASE_MASK: u32 = 0x1Fu;
@@ -30,18 +40,10 @@ const OVERLAY_SHIFT: u32 = 5u;
 const OVERLAY_MASK: u32 = 0x1Fu;
 const BLEND_SHIFT: u32 = 10u;
 const BLEND_MASK: u32 = 0xFFu;
-// A hand painted this cell, so its own word is what it draws.
-const MANUAL_BIT: u32 = 0x40000u;
 
 // Entries in `uv_scales`, which is four `vec4`s wide.
 const MAX_LAYERS: u32 = 16u;
 
-// What a slot that sets no reflectance shades at: a StandardMaterial's
-// default, 4% at normal incidence.
-const DEFAULT_REFLECTANCE: f32 = 0.5;
-
-// height a slot with no height map blends at
-const FLAT_HEIGHT: f32 = 128.0 / 255.0;
 
 struct SplatUniform {
     // 16 per-id UV scales, packed four to a vec4 for uniform alignment.
@@ -112,47 +114,13 @@ fn uv_scale_for(id: u32) -> f32 {
     return splat.uv_scales[id / 4u][id % 4u];
 }
 
-// `id` must already be clamped by `last_layer`.
-// A slot's own roughness or reflectance, negative where it sets none.
-fn slot_value(values: array<vec4<f32>, 4>, id: u32) -> f32 {
-    return values[id / 4u][id % 4u];
-}
 
-fn detile_for(id: u32) -> f32 {
-    return splat.detile_strengths[id / 4u][id % 4u];
-}
-
-// Two uncorrelated values in 0..1 from a tile coordinate. Integer-valued
-// input, so the hash only has to separate whole numbers.
-fn tile_hash(tile: vec2<f32>) -> vec2<f32> {
-    var h = fract(vec3<f32>(tile.x, tile.y, tile.x + tile.y) * vec3<f32>(0.1031, 0.1030, 0.0973));
-    h += dot(h, h.yzx + 33.33);
-    return fract((h.xx + h.yz) * h.zy);
-}
-
-// One tile's own rigid sample frame: the tile's rotation and shift are applied
-// whole, and the four tiles around a fragment are blended after each has been
-// sampled in its own frame.
+// Where one layer is read: its texture coordinate and how that coordinate
+// changes across the screen, for sampling with explicit derivatives.
 struct TileTap {
     uv: vec2<f32>,
     ddx: vec2<f32>,
     ddy: vec2<f32>,
-    // The rotation that produced `uv`, as a unit `(cos, sin)`. Anything
-    // sampled through it that is itself a direction - a tangent-space
-    // normal - has to turn back by the same angle.
-    turn: vec2<f32>,
-    weight: f32,
-}
-
-// The tiles one fragment reads, with the share each of them takes.
-struct Sampling {
-    taps: array<TileTap, 4>,
-    count: u32,
-}
-
-// `v` turned by the unit `(cos, sin)` in `turn`.
-fn turned_by(v: vec2<f32>, turn: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(turn.x * v.x - turn.y * v.y, turn.y * v.x + turn.x * v.y);
 }
 
 fn texel_sharp(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, size: vec2<f32>) -> vec2<f32> {
@@ -161,64 +129,6 @@ fn texel_sharp(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, size: vec2<f32>) -
     let edge = floor(texel + 0.5);
     let across = smoothstep(-0.5 * footprint, 0.5 * footprint, texel - edge) - 0.5;
     return (edge + across) / size;
-}
-
-// Break a tiled texture out of its grid.
-//
-// Every tile of the repeat is turned and shifted by its own amount, drawn from a
-// hash of its coordinate. The four nearest tiles are each sampled in their own
-// frame and the sampled values blended with the bilinear weights of the position
-// between their centres, so a tile's weight reaches zero where it is left and the
-// blend is continuous across the plane.
-//
-// Sampling per tile, rather than blending the four tiles' coordinates and
-// sampling once, is the whole point: interpolating between rigid transforms is
-// not a rigid transform, and the blended coordinate field stretches and shears
-// between tile centres. This is the standard technique (Inigo Quilez's texture
-// repetition; Unity HDRP and Unreal call it procedural or stochastic tiling).
-//
-// Each tap carries its own derivatives, and a rigid frame makes them exact. The
-// rotation pivots on the tile centres rather than the texture origin, so the
-// displacement does not grow with how far the terrain runs.
-//
-// `strength` 0 returns a single tap holding exactly what came in.
-fn detile(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, strength: f32) -> Sampling {
-    var out: Sampling;
-    out.count = 1u;
-    out.taps[0].uv = uv;
-    out.taps[0].ddx = ddx;
-    out.taps[0].ddy = ddy;
-    out.taps[0].turn = vec2<f32>(1.0, 0.0);
-    out.taps[0].weight = 1.0;
-    if strength <= 0.0 {
-        return out;
-    }
-
-    // Half a tile back, so `base` names the four tile centres around the
-    // sample rather than the corners of the tile it is inside.
-    let p = uv - vec2<f32>(0.5);
-    let base = floor(p);
-    let f = smoothstep(vec2<f32>(0.0), vec2<f32>(1.0), fract(p));
-
-    out.count = 4u;
-    for (var j = 0u; j < 2u; j++) {
-        for (var i = 0u; i < 2u; i++) {
-            let corner = base + vec2<f32>(f32(i), f32(j));
-            let weight = mix(1.0 - f.x, f.x, f32(i)) * mix(1.0 - f.y, f.y, f32(j));
-            let hash = tile_hash(corner);
-            let angle = (hash.x * 2.0 - 1.0) * strength * 3.14159265;
-            let shift = (hash - vec2<f32>(0.5)) * strength;
-            let pivot = corner + vec2<f32>(0.5);
-            let turn = vec2<f32>(cos(angle), sin(angle));
-            let index = j * 2u + i;
-            out.taps[index].uv = pivot + turned_by(uv - pivot, turn) + shift;
-            out.taps[index].ddx = turned_by(ddx, turn);
-            out.taps[index].ddy = turned_by(ddy, turn);
-            out.taps[index].turn = turn;
-            out.taps[index].weight = weight;
-        }
-    }
-    return out;
 }
 
 // The texel a grid coordinate's lower corner sits in. `control_resolution`
@@ -233,34 +143,28 @@ fn gather_uv(corner: vec2<i32>, size: vec2<u32>) -> vec2<f32> {
     return (vec2<f32>(corner) + 1.0) / vec2<f32>(size);
 }
 
-// The stored slope under a fragment, bilinear across the four grid points around
-// it.
-//
-// Filtered rather than nearest so the band between the two textures moves
-// smoothly across a cell, and taken on the slope rather than on the two control
-// words it produces so the four corners agree wherever the ground is uniformly
-// flat or steep, which keeps the single-word fast path below covering most of a
-// terrain.
-fn slope_at(corner: vec2<i32>, f: vec2<f32>) -> f32 {
-    // x = (0, 1), y = (1, 1), z = (1, 0), w = (0, 0)
-    let s = textureGather(0, slope_map, point_sampler, gather_uv(corner, textureDimensions(slope_map)));
-    return mix(mix(s.w, s.z, f.x), mix(s.x, s.y, f.x), f.y);
+fn ground_normal(corner: vec2<i32>, f: vec2<f32>) -> vec3<f32> {
+    let last = vec2<i32>(textureDimensions(slope_map)) - 1;
+    let g00 = textureLoad(slope_map, clamp(corner, vec2<i32>(0), last), 0).yz;
+    let g10 = textureLoad(slope_map, clamp(corner + vec2<i32>(1, 0), vec2<i32>(0), last), 0).yz;
+    let g01 = textureLoad(slope_map, clamp(corner + vec2<i32>(0, 1), vec2<i32>(0), last), 0).yz;
+    let g11 = textureLoad(slope_map, clamp(corner + vec2<i32>(1, 1), vec2<i32>(0), last), 0).yz;
+    let g = mix(mix(g00, g10, f.x), mix(g01, g11, f.x), f.y);
+    return normalize(vec3<f32>(g.x, sqrt(max(1.0 - dot(g, g), 0.0)), g.y));
 }
 
+// what the matte lighting reads from a layer; its height and roughness maps
+// change nothing it draws, so they aren't sampled
 struct LayerSlots {
     layer: i32,
-    has_height: bool,
     has_normal: bool,
     has_occlusion: bool,
-    has_roughness: bool,
 }
 
 struct LayerSample {
     albedo: vec3<f32>,
-    height: f32,
     normal: vec3<f32>,
     occlusion: f32,
-    roughness: f32,
 }
 
 fn sample_tap(tap: TileTap, slots: LayerSlots) -> LayerSample {
@@ -268,58 +172,17 @@ fn sample_tap(tap: TileTap, slots: LayerSlots) -> LayerSample {
     let uv = texel_sharp(tap.uv, tap.ddx, tap.ddy, layer_size);
     var out: LayerSample;
     out.albedo = textureSampleGrad(albedo_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).rgb;
-    out.height = FLAT_HEIGHT;
-    if slots.has_height {
-        out.height = textureSampleGrad(height_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).r;
-    }
     out.normal = vec3<f32>(0.0, 0.0, 1.0);
     if slots.has_normal {
         let packed = textureSampleGrad(normal_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).rgb;
-        let unpacked = packed * 2.0 - 1.0;
-        let back = turned_by(unpacked.xy, vec2<f32>(tap.turn.x, -tap.turn.y));
-        out.normal = vec3<f32>(back, unpacked.z);
+        out.normal = packed * 2.0 - 1.0;
     }
     out.occlusion = 1.0;
     if slots.has_occlusion {
         out.occlusion = textureSampleGrad(
             occlusion_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).r;
     }
-    out.roughness = 1.0;
-    if slots.has_roughness {
-        out.roughness = textureSampleGrad(
-            roughness_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).g;
-    }
     return out;
-}
-
-fn sample_detiled(tiled: Sampling, slots: LayerSlots) -> LayerSample {
-    var sum: LayerSample;
-    sum.albedo = vec3<f32>(0.0);
-    sum.height = 0.0;
-    sum.normal = vec3<f32>(0.0);
-    sum.occlusion = 0.0;
-    sum.roughness = 0.0;
-    var taken = 0.0;
-    for (var t = 0u; t < tiled.count; t++) {
-        let tap = tiled.taps[t];
-        if tap.weight <= 1e-4 {
-            continue;
-        }
-        let one = sample_tap(tap, slots);
-        sum.albedo += tap.weight * one.albedo;
-        sum.height += tap.weight * one.height;
-        sum.normal += tap.weight * one.normal;
-        sum.occlusion += tap.weight * one.occlusion;
-        sum.roughness += tap.weight * one.roughness;
-        taken += tap.weight;
-    }
-    let inv = 1.0 / max(taken, 1e-8);
-    sum.albedo *= inv;
-    sum.height *= inv;
-    sum.normal *= inv;
-    sum.occlusion *= inv;
-    sum.roughness *= inv;
-    return sum;
 }
 
 const SIDE_START_COS: f32 = 0.766; // 40 degrees
@@ -355,33 +218,27 @@ fn project(surface: Surface, scale: f32, texels: f32) -> TileTap {
     let p = surface.p * scale;
     let dx = surface.ddx * scale;
     let dy = surface.ddy * scale;
-    let side = cell_hash(vec3<i32>(floor(p * texels))) < surface.steep;
+    // ground that isn't steep at all never takes a side projection, so it skips the hash
+    let side = surface.steep > 0.0 && cell_hash(vec3<i32>(floor(p * texels))) < surface.steep;
     if !side {
-        return TileTap(p.xz, dx.xz, dy.xz, vec2<f32>(1.0, 0.0), 1.0);
+        return TileTap(p.xz, dx.xz, dy.xz);
     }
     // texture v runs down, height runs up
     if surface.faces_x {
         return TileTap(
-            vec2<f32>(p.z, -p.y), vec2<f32>(dx.z, -dx.y), vec2<f32>(dy.z, -dy.y), vec2<f32>(1.0, 0.0), 1.0);
+            vec2<f32>(p.z, -p.y), vec2<f32>(dx.z, -dx.y), vec2<f32>(dy.z, -dy.y));
     }
     return TileTap(
-        vec2<f32>(p.x, -p.y), vec2<f32>(dx.x, -dx.y), vec2<f32>(dy.x, -dy.y), vec2<f32>(1.0, 0.0), 1.0);
+        vec2<f32>(p.x, -p.y), vec2<f32>(dx.x, -dx.y), vec2<f32>(dy.x, -dy.y));
 }
 
 fn sample_layer(layer_id: u32, surface: Surface) -> LayerSample {
     let slots = LayerSlots(
         i32(layer_id),
-        ((splat.height_slots >> layer_id) & 1u) != 0u,
         ((splat.normal_slots >> layer_id) & 1u) != 0u,
         ((splat.occlusion_slots >> layer_id) & 1u) != 0u,
-        ((splat.roughness_slots >> layer_id) & 1u) != 0u,
     );
-    let projected = project(surface, uv_scale_for(layer_id), f32(textureDimensions(albedo_array).x));
-    let strength = detile_for(layer_id);
-    if strength <= 0.0 {
-        return sample_tap(projected, slots);
-    }
-    return sample_detiled(detile(projected.uv, projected.ddx, projected.ddy, strength), slots);
+    return sample_tap(project(surface, uv_scale_for(layer_id), f32(textureDimensions(albedo_array).x)), slots);
 }
 
 struct Accum {
@@ -391,64 +248,158 @@ struct Accum {
     overlay_weights: vec4<f32>,
 }
 
-// you have a 4 texture mask like (0, 0, 1, 1)
-// with a weighting like (0.4, 0.2, 0.1, 0.3)
-// the share_below(1) is the mask (1, 1, 0, 0) i.e. (true true false false)
-// sum the matching weights 0.4 + 0.2 = 0.6
-fn share_below(accum: Accum, id: u32) -> f32 {
+// The share of the corners' weight that goes to layers numbered `id` or lower:
+// with ids (0, 0, 1, 1) and weights (0.4, 0.2, 0.1, 0.3), layer 0 has 0.6.
+fn share_upto(accum: Accum, id: u32) -> f32 {
     let one = vec4<f32>(1.0);
     let zero = vec4<f32>(0.0);
-    return dot(accum.base_weights, select(zero, one, accum.base_ids < vec4<u32>(id)))
-        + dot(accum.overlay_weights, select(zero, one, accum.overlay_ids < vec4<u32>(id)));
+    return dot(accum.base_weights, select(zero, one, accum.base_ids <= vec4<u32>(id)))
+        + dot(accum.overlay_weights, select(zero, one, accum.overlay_ids <= vec4<u32>(id)));
 }
-
-// same as share below but with the inverse masking rule
-fn share_of(accum: Accum, id: u32) -> f32 {
-    let one = vec4<f32>(1.0);
-    let zero = vec4<f32>(0.0);
-    return dot(accum.base_weights, select(zero, one, accum.base_ids == vec4<u32>(id)))
-        + dot(accum.overlay_weights, select(zero, one, accum.overlay_ids == vec4<u32>(id)));
-}
-
 fn dithered_layer(accum: Accum, threshold: f32) -> u32 {
+    let only = accum.base_ids.x;
+    let overlay_same = (accum.overlay_ids == vec4<u32>(only)) | (accum.overlay_weights == vec4<f32>(0.0));
+    if all(accum.base_ids == vec4<u32>(only)) && all(overlay_same) {
+        return only;
+    }
     let level = threshold * (dot(accum.base_weights, vec4<f32>(1.0)) + dot(accum.overlay_weights, vec4<f32>(1.0)));
-    var chosen = accum.base_ids.x;
+    var chosen = 0xFFFFFFFFu;
     for (var k = 0u; k < 4u; k++) {
-        let base = share_below(accum, accum.base_ids[k]);
-        if base <= level && level < base + share_of(accum, accum.base_ids[k]) {
-            chosen = accum.base_ids[k];
+        let base = accum.base_ids[k];
+        if base < chosen && share_upto(accum, base) > level {
+            chosen = base;
         }
-        let overlay = share_below(accum, accum.overlay_ids[k]);
-        if overlay <= level && level < overlay + share_of(accum, accum.overlay_ids[k]) {
-            chosen = accum.overlay_ids[k];
+        let overlay = accum.overlay_ids[k];
+        if overlay < chosen && share_upto(accum, overlay) > level {
+            chosen = overlay;
         }
     }
-    return chosen;
+    return select(chosen, accum.base_ids.x, chosen == 0xFFFFFFFFu);
 }
 
+fn texel_position(
+    world: vec4<f32>,
+    surface: Surface,
+    at: vec2<f32>,
+    cell: vec2<i32>,
+    texel: f32,
+) -> vec4<f32> {
+    let to_centre = (vec2<f32>(cell) + 0.5) * texel - at;
+    let a = surface.ddx;
+    let b = surface.ddy;
+    // the screen steps in the grid's own two directions
+    var a_grid = a.xz;
+    var b_grid = b.xz;
+    if surface.steep >= 0.5 {
+        let across = select(vec2<f32>(a.x, b.x), vec2<f32>(a.z, b.z), surface.faces_x);
+        a_grid = vec2<f32>(across.x, -a.y);
+        b_grid = vec2<f32>(across.y, -b.y);
+    }
+    let det = a_grid.x * b_grid.y - a_grid.y * b_grid.x;
+    if abs(det) < 1e-12 {
+        return world;
+    }
+    let along_a = (to_centre.x * b_grid.y - to_centre.y * b_grid.x) / det;
+    let along_b = (a_grid.x * to_centre.y - a_grid.y * to_centre.x) / det;
+    return world + vec4<f32>(a * along_a + b * along_b, 0.0);
+}
+
+@if(ENVIRONMENT_MAP)
+fn sky_irradiance(direction: vec3<f32>) -> vec3<f32> {
+    var toward = quat_rotate(light_probes.view_rotation, direction);
+    toward.z = -toward.z;
+    @if(MULTIPLE_LIGHT_PROBES_IN_ARRAY) {
+        return textureSampleLevel(
+            diffuse_environment_maps[light_probes.view_cubemap_index],
+            environment_map_sampler,
+            toward,
+            0.0,
+        ).rgb;
+    } @else {
+        return textureSampleLevel(diffuse_environment_map, environment_map_sampler, toward, 0.0).rgb;
+    }
+}
+
+fn point_arriving(id: u32, at: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let light = &clustered_lights.data[id];
+    let to_light = (*light).position_radius.xyz - at;
+    let attenuation = getDistanceAttenuation(dot(to_light, to_light), (*light).color_inverse_square_range.w);
+    return (*light).color_inverse_square_range.rgb * attenuation * saturate(dot(n, normalize(to_light)));
+}
+
+fn spot_cone(id: u32, at: vec3<f32>) -> f32 {
+    let light = &clustered_lights.data[id];
+    let packed = (*light).light_custom_data;
+    var axis = vec3<f32>(packed.x, 0.0, packed.y);
+    axis.y = sqrt(max(0.0, 1.0 - axis.x * axis.x - axis.z * axis.z));
+    if ((*light).flags & POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE) != 0u {
+        axis.y = -axis.y;
+    }
+    let toward = normalize((*light).position_radius.xyz - at);
+    let cone = saturate(dot(-axis, toward) * packed.z + packed.w);
+    return cone * cone;
+}
+
+fn terrain_lighting(in: pbr_types::PbrInput) -> vec3<f32> {
+    let diffuse = in.material.base_color.rgb;
+    let n = in.N;
+    let at = in.world_position;
+    let receives = (in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u;
+    let view_z = dot(vec4<f32>(
+        view.view_from_world[0].z,
+        view.view_from_world[1].z,
+        view.view_from_world[2].z,
+        view.view_from_world[3].z,
+    ), at);
+    var arriving = vec3<f32>(0.0);
+
+    for (var i = 0u; i < lights.n_directional_lights; i += 1u) {
+        let light = &lights.directional_lights[i];
+        let facing = saturate(dot(n, (*light).direction_to_light));
+        if facing <= 0.0 {
+            continue;
+        }
+        var shadow = 1.0;
+        if receives && ((*light).flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
+            shadow = shadows::fetch_directional_shadow(i, at, in.world_normal, view_z, in.frag_coord.xy);
+        }
+        arriving += (*light).color.rgb * facing * shadow;
+    }
+
+    let ranges = clustering::unpack_clusterable_object_index_ranges(
+        clustering::view_fragment_cluster_index(in.frag_coord.xy, view_z, in.is_orthographic));
+    for (var i = ranges.first_point_light_index_offset; i < ranges.first_spot_light_index_offset; i += 1u) {
+        let id = clustering::get_clusterable_object_id(i);
+        var shadow = 1.0;
+        if receives && (clustered_lights.data[id].flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
+            shadow = shadows::fetch_point_shadow(id, at, in.world_normal, in.frag_coord.xy);
+        }
+        arriving += point_arriving(id, at.xyz, n) * shadow;
+    }
+    for (var i = ranges.first_spot_light_index_offset; i < ranges.first_rect_light_index_offset; i += 1u) {
+        let id = clustering::get_clusterable_object_id(i);
+        let light = &clustered_lights.data[id];
+        var shadow = 1.0;
+        if receives && ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
+            shadow = shadows::fetch_spot_shadow(id, at, in.world_normal, (*light).shadow_map_near_z, in.frag_coord.xy);
+        }
+        arriving += point_arriving(id, at.xyz, n) * spot_cone(id, at.xyz) * shadow;
+    }
+
+    var ambient = diffuse * lights.ambient_color.rgb * in.diffuse_occlusion;
+    @if(ENVIRONMENT_MAP) {
+        if light_probes.view_cubemap_index >= 0 {
+            ambient += diffuse * sky_irradiance(n) * light_probes.intensity_for_view * in.diffuse_occlusion;
+        }
+    }
+    return (diffuse * arriving / PI + ambient) * view.exposure;
+}
 
 fn bayer(cell: vec2<u32>) -> f32 {
     let lo = cell & vec2<u32>(1u);
     let hi = (cell >> vec2<u32>(1u)) & vec2<u32>(1u);
     let rank = 4u * (((lo.x ^ lo.y) << 1u) | lo.y) + (((hi.x ^ hi.y) << 1u) | hi.y);
     return (f32(rank) + 0.5) / 16.0;
-}
-
-// The control word a cell's own slope stands for.
-//
-// A word, not a colour: the two slots and the blend between them are what a hand
-// would have painted for this slope, so the fragment carries on into
-// `accumulate_control` and picks up the height blend, the detiling and the mip
-// derivatives that painted ground gets.
-//
-// `smoothstep` across the authored range means flat ground is purely the base
-// slot and anything past the far end purely the slope slot.
-fn autoterrain_control(slope: f32) -> u32 {
-    let t = smoothstep(splat.autoterrain_slope_start, splat.autoterrain_slope_end, slope);
-    let blend = u32(clamp(t, 0.0, 1.0) * 255.0 + 0.5);
-    return ((splat.autoterrain_base_slot & BASE_MASK) << BASE_SHIFT)
-        | ((splat.autoterrain_slope_slot & OVERLAY_MASK) << OVERLAY_SHIFT)
-        | ((blend & BLEND_MASK) << BLEND_SHIFT);
 }
 
 @fragment
@@ -467,21 +418,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     surface.steep = saturate((SIDE_START_COS - n.y) / (SIDE_START_COS - SIDE_END_COS));
     surface.faces_x = abs(n.x) > abs(n.z);
 
-    // The tint is sampled, not loaded: it is a colour, so two of them interpolate
-    // into a colour. Taken here, with the derivatives, because the per-layer
-    // branches below are not uniform control flow.
-    //
-    // Grid point i sits at i/(res-1) in UV0, while texel i is sampled at its
-    // centre, (i+0.5)/res. Without the remap the layer would be half a cell out of
-    // register with the control map, in opposite directions at the two edges.
-    // `render::tint_uv` spells the same mapping in Rust.
-    let tint_res = f32(max(splat.control_resolution, 2u));
-    let tint_uv = (in.uv * (tint_res - 1.0) + 0.5) / tint_res;
-    var tint = vec3<f32>(1.0);
-    if splat.tint_strength > 0.0 {
-        tint = textureSample(tint_map, tint_sampler, tint_uv).rgb;
-    }
-
     // manipulate uvs to be whole texels
     var finest = 0.0;
     for (var i = 0u; i <= last_layer(); i++) {
@@ -496,22 +432,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     // gather order: x = (0, 1), y = (1, 1), z = (1, 0), w = (0, 0)
     let words = textureGather(0, control_map, point_sampler, gather_uv(corner, textureDimensions(control_map)));
-    var c00 = words.w;
-    var c10 = words.z;
-    var c01 = words.x;
-    var c11 = words.y;
-
-    // A terrain with autoterrain off never reaches this, and a cell a
-    // hand claimed keeps the word it was painted with. Everything
-    // downstream reads these four words and cannot tell which of them
-    // came from the control map.
-    if splat.autoterrain_enabled != 0u {
-        let unclaimed = autoterrain_control(slope_at(corner, f));
-        c00 = select(unclaimed, c00, (c00 & MANUAL_BIT) != 0u);
-        c10 = select(unclaimed, c10, (c10 & MANUAL_BIT) != 0u);
-        c01 = select(unclaimed, c01, (c01 & MANUAL_BIT) != 0u);
-        c11 = select(unclaimed, c11, (c11 & MANUAL_BIT) != 0u);
-    }
+    let c00 = words.w;
+    let c10 = words.z;
+    let c01 = words.x;
+    let c11 = words.y;
 
     let inv = vec2<f32>(1.0) - f;
     let w = vec4<f32>(inv.x * inv.y, f.x * inv.y, inv.x * f.y, f.x * f.y);
@@ -544,31 +468,23 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let dither_cell = vec2<i32>(floor(dither_at / texel));
     let layer_id = dithered_layer(accum, bayer(vec2<u32>(dither_cell & vec2<i32>(3))));
     let sampled = sample_layer(layer_id, surface);
-    let own_roughness = slot_value(splat.slot_roughness, layer_id);
-    var roughness_scale = 1.0;
-    if own_roughness >= 0.0 {
-        roughness_scale = own_roughness;
-    } else if ((splat.roughness_slots >> layer_id) & 1u) == 0u {
-        roughness_scale = splat.perceptual_roughness;
-    }
-    let own_reflectance = slot_value(splat.slot_reflectance, layer_id);
-    let albedo = sampled.albedo * mix(vec3<f32>(1.0), tint, splat.tint_strength);
+    let albedo = sampled.albedo;
     let tangent_normal = sampled.normal;
     let occlusion = sampled.occlusion;
-    let roughness = min(sampled.roughness * roughness_scale, 1.0);
-    let reflectance = select(DEFAULT_REFLECTANCE, own_reflectance, own_reflectance >= 0.0);
 
     // The mesher emits no tangents: UV0 runs along world X and Z, so the tangent
     // is world +X projected onto the surface normal. That projection collapses
     // where the surface stands vertical and faces X, so +Z stands in there.
     // Picking the axis the normal leans on least would swap the frame by 90
     // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
+    let lit_at = texel_position(in.world_position, surface, dither_at, dither_cell, texel);
+    let lit_n = ground_normal(corner, f);
     var reference = vec3<f32>(1.0, 0.0, 0.0);
-    if abs(n.x) > 0.999 {
+    if abs(lit_n.x) > 0.999 {
         reference = vec3<f32>(0.0, 0.0, 1.0);
     }
-    let t = normalize(reference - n * dot(reference, n));
-    let tbn = mat3x3<f32>(t, cross(t, n), n);
+    let t = normalize(reference - lit_n * dot(reference, lit_n));
+    let tbn = mat3x3<f32>(t, cross(t, lit_n), lit_n);
     let mapped_normal = normalize(tbn * normalize(tangent_normal));
 
     var pbr_input = pbr_types::pbr_input_new();
@@ -576,23 +492,20 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // bits. Leaving them zero renders terrain that no shadow ever falls on.
     pbr_input.flags = mesh[in.instance_index].flags;
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
-    pbr_input.material.perceptual_roughness = roughness;
-    pbr_input.material.reflectance = vec3<f32>(reflectance);
-    pbr_input.material.metallic = 0.0;
     pbr_input.diffuse_occlusion = vec3<f32>(occlusion);
     // `standard_material_new` leaves fog off; `StandardMaterial`'s Rust
     // default has it on, and terrain that ignores the scene's fog while
     // everything beside it obeys reads as a hole in the distance.
     pbr_input.material.flags |= pbr_types::STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
     pbr_input.frag_coord = in.position;
-    pbr_input.world_position = in.world_position;
-    pbr_input.world_normal = n;
+    pbr_input.world_position = lit_at;
+    pbr_input.world_normal = lit_n;
     pbr_input.N = mapped_normal;
     pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;
-    pbr_input.V = pbr_functions::calculate_view(in.world_position, pbr_input.is_orthographic);
+    pbr_input.V = pbr_functions::calculate_view(pbr_input.world_position, pbr_input.is_orthographic);
 
     var out: FragmentOutput;
-    out.color = pbr_functions::apply_pbr_lighting(pbr_input);
+    out.color = vec4<f32>(terrain_lighting(pbr_input), 1.0);
     out.color = pbr_functions::main_pass_post_lighting_processing(pbr_input, out.color);
     return out;
 }

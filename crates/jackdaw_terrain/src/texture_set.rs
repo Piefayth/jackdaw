@@ -50,7 +50,7 @@ pub const MAX_SLOT_ROUGHNESS: f32 = 2.0;
 
 /// Reflectance a slot shades at when it sets none of its own: a
 /// `StandardMaterial`'s default, 4% at normal incidence.
-pub const DEFAULT_REFLECTANCE: f32 = 0.5;
+pub const DEFAULT_REFLECTANCE: f32 = 0.0;
 
 /// Strongest detiling a slot may declare. Past a full turn of rotation
 /// and a whole tile of offset there is nothing further to break up.
