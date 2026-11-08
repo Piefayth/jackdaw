@@ -13,6 +13,8 @@
 //! `pow(corner_weight + layer_weight + height, sharpness)`, normalized across
 //! every contributing layer. See `shaders/terrain_splat.wesl`.
 
+use std::collections::HashMap;
+
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
@@ -45,8 +47,8 @@ use crate::heightmap::Heightmap;
 use crate::sidecar::{AutoTerrainSettings, SurfaceSettings, TerrainMaterialSlot};
 use crate::splat::ControlTexels;
 use crate::texture_set::{
-    DEFAULT_PERCEPTUAL_ROUGHNESS, MAX_TEXTURES, TextureSet, TextureSetEntry, TextureSetError,
-    check_layer_sizes,
+    DEFAULT_PERCEPTUAL_ROUGHNESS, MAX_TEXTURES, MAX_VARIANTS, TextureSet, TextureSetEntry,
+    TextureSetError, TileVariety, check_layer_sizes,
 };
 
 const SHADER_PATH: &str = "embedded://jackdaw_terrain/render/shaders/terrain_splat.wesl";
@@ -93,6 +95,9 @@ pub struct TextureSetImages {
     pub occlusion: Vec<Option<Handle<Image>>>,
     /// Roughness handle per entry, `None` where the entry has none.
     pub roughness: Vec<Option<Handle<Image>>>,
+    /// Every entry's variant albedos, entry after entry, each entry's in the
+    /// order its [`TextureSetEntry::variants`] lists them.
+    pub variants: Vec<Handle<Image>>,
 }
 
 impl TextureSetImages {
@@ -106,6 +111,7 @@ impl TextureSetImages {
             .chain(self.height.iter().flatten())
             .chain(self.occlusion.iter().flatten())
             .chain(self.roughness.iter().flatten())
+            .chain(self.variants.iter())
     }
 }
 
@@ -197,6 +203,8 @@ pub fn resolve_with<'m>(
                 detile: slot.detile,
                 perceptual_roughness: slot.perceptual_roughness,
                 reflectance: slot.reflectance,
+                variants: Vec::new(),
+                turn: false,
             },
             SlotHandles {
                 albedo: material.base_color_texture.clone(),
@@ -221,7 +229,26 @@ struct SlotHandles {
     roughness: Option<Handle<Image>>,
 }
 
+#[derive(Resource, Clone, Debug, Default)]
+pub struct TerrainTileVariety(pub HashMap<String, TileVariety>);
+
 impl ResolvedSlots {
+    pub fn add_variety(&mut self, table: &TerrainTileVariety, assets: &AssetServer) {
+        for entry in &mut self.set.entries {
+            let Some(variety) = table.0.get(&entry.material) else {
+                continue;
+            };
+            entry.variants = variety.variants.clone();
+            entry.turn = variety.turn;
+            self.images.variants.extend(
+                variety
+                    .variants
+                    .iter()
+                    .map(|variant| assets.load(variant.albedo.clone())),
+            );
+        }
+    }
+
     /// Append one slot's entry and its handles together, so the entries and
     /// the handle lists cannot fall out of step.
     fn push(&mut self, entry: TextureSetEntry, handles: SlotHandles) {
@@ -304,9 +331,10 @@ pub fn splat_images(
         return Err(SplatBuildError::Invalid(TextureSetError::Empty));
     }
 
-    let albedo_layers = decode_layers(&handles.albedo, set, images, |entry| {
+    let mut albedo_layers = decode_layers(&handles.albedo, set, images, |entry| {
         entry.albedo.as_deref().unwrap_or_default()
     })?;
+    add_variant_layers(&mut albedo_layers, &handles.variants, set, images)?;
     // The layer size is whatever the resolved albedos agree on. A set
     // whose materials all went missing has none to measure, and builds
     // one texel per layer.
@@ -317,7 +345,7 @@ pub fn splat_images(
 
     let albedo = stack(
         &albedo_layers,
-        handles.albedo.len(),
+        handles.albedo.len() + handles.variants.len(),
         (width, height),
         TextureFormat::Rgba8UnormSrgb,
         FALLBACK_ALBEDO_TEXEL,
@@ -409,6 +437,31 @@ fn decode_layers<'a>(
         decoded.push(Some(image));
     }
     Ok(DecodedLayers { decoded, sizes })
+}
+
+/// Append every entry's variant albedos after the entries' own layers, in the
+/// order [`TextureSetImages::variants`] holds them.
+fn add_variant_layers<'a>(
+    layers: &mut DecodedLayers<'a>,
+    handles: &[Handle<Image>],
+    set: &'a TextureSet,
+    images: &'a impl LayerPixels,
+) -> Result<(), SplatBuildError> {
+    let owners = set.entries.iter().enumerate().flat_map(|(index, entry)| {
+        entry.variants.iter().map(move |variant| (index, entry, variant))
+    });
+    for (handle, (index, entry, variant)) in handles.iter().zip(owners) {
+        let image = images.layer(handle).ok_or(SplatBuildError::NotReady)?;
+        let size = image.size();
+        layers.sizes.push((
+            index,
+            entry.material.as_str(),
+            variant.albedo.as_str(),
+            (size.x, size.y),
+        ));
+        layers.decoded.push(Some(image));
+    }
+    Ok(())
 }
 
 /// Build one array from a per-entry list of optional handles. A layer with no
@@ -908,10 +961,6 @@ pub struct TerrainSplatMaterial {
     /// Per-id UV scales, four to a `Vec4`. The shader unpacks by id.
     #[uniform(0)]
     pub uv_scales: [Vec4; MAX_TEXTURES / 4],
-    /// Per-id detiling strengths, packed the same way. 0 leaves a layer
-    /// sampled exactly where its UV scale puts it.
-    #[uniform(0)]
-    pub detile_strengths: [Vec4; MAX_TEXTURES / 4],
     /// Per-id perceptual roughness each slot sets of its own, packed the
     /// same way. Negative where a slot sets none: its map as it is, or
     /// [`Self::perceptual_roughness`] without one.
@@ -971,6 +1020,10 @@ pub struct TerrainSplatMaterial {
     pub normal_slots: u32,
     #[uniform(0)]
     pub height_slots: u32,
+    #[uniform(0)]
+    pub variant_ranges: [UVec4; MAX_TEXTURES / 4],
+    #[uniform(0)]
+    pub variant_weights: [Vec4; MAX_VARIANTS / 4],
     #[texture(1, dimension = "2d_array")]
     #[sampler(2)]
     pub albedo: Handle<Image>,
@@ -1024,10 +1077,6 @@ impl TerrainSplatMaterial {
         for (i, scale) in scales.iter().enumerate() {
             uv_scales[i / 4][i % 4] = *scale;
         }
-        let mut detile_strengths = [Vec4::ZERO; MAX_TEXTURES / 4];
-        for (i, strength) in set.detile_strengths().iter().enumerate() {
-            detile_strengths[i / 4][i % 4] = *strength;
-        }
         let packed = |values: [Option<f32>; MAX_TEXTURES]| {
             let mut out = [Vec4::splat(-1.0); MAX_TEXTURES / 4];
             for (i, value) in values.iter().enumerate() {
@@ -1037,9 +1086,27 @@ impl TerrainSplatMaterial {
             }
             out
         };
+        let mut variant_ranges = [UVec4::ZERO; MAX_TEXTURES / 4];
+        let mut variant_weights = [Vec4::ZERO; MAX_VARIANTS / 4];
+        let mut next = 0usize;
+        for (id, entry) in set.entries.iter().take(MAX_TEXTURES).enumerate() {
+            let count = entry.variants.len().min(MAX_VARIANTS - next);
+            variant_ranges[id / 4][id % 4] =
+                next as u32 | (count as u32) << 16 | u32::from(entry.turn) << 31;
+            let total: f32 = entry.variants[..count].iter().map(|v| v.weight).sum();
+            let mut running = 0.0;
+            for (i, variant) in entry.variants[..count].iter().enumerate() {
+                running += variant.weight;
+                let at = next + i;
+                variant_weights[at / 4][at % 4] =
+                    if i + 1 == count { 1.0 } else { running / total };
+            }
+            next += count;
+        }
         let mut material = Self {
             uv_scales,
-            detile_strengths,
+            variant_ranges,
+            variant_weights,
             slot_roughness: packed(set.perceptual_roughness()),
             slot_reflectance: packed(set.reflectances()),
             terrain_size,

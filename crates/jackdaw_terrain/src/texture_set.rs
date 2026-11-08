@@ -34,6 +34,8 @@ pub const MIN_UV_SCALE: f32 = 0.001;
 /// hash noise at any viewing distance.
 pub const MAX_UV_SCALE: f32 = 100.0;
 
+pub const MAX_VARIANTS: usize = 64;
+
 /// Detiling strength a slot uses when it does not say: off.
 ///
 /// At 0 the shader samples the UVs the slot's scale alone puts it at.
@@ -98,6 +100,24 @@ pub struct TextureSetEntry {
     pub perceptual_roughness: Option<f32>,
     /// The slot's own reflectance, or `None` for [`DEFAULT_REFLECTANCE`].
     pub reflectance: Option<f32>,
+
+    pub variants: Vec<TileVariant>,
+    pub turn: bool,
+}
+
+/// One albedo an entry's tiles may draw, and how often relative to the others.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileVariant {
+    pub albedo: String,
+    pub weight: f32,
+}
+
+/// How a material's tiles vary: the albedos they choose between, and whether
+/// they turn and flip.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TileVariety {
+    pub variants: Vec<TileVariant>,
+    pub turn: bool,
 }
 
 impl TextureSetEntry {
@@ -132,6 +152,8 @@ impl TextureSetEntry {
             detile: DEFAULT_DETILE,
             perceptual_roughness: None,
             reflectance: None,
+            variants: Vec::new(),
+            turn: false,
         }
     }
 
@@ -150,6 +172,8 @@ impl TextureSetEntry {
             detile: DEFAULT_DETILE,
             perceptual_roughness: None,
             reflectance: None,
+            variants: Vec::new(),
+            turn: false,
         }
     }
 
@@ -166,6 +190,7 @@ impl TextureSetEntry {
         .into_iter()
         .flatten()
         .map(String::as_str)
+        .chain(self.variants.iter().map(|variant| variant.albedo.as_str()))
     }
 }
 
@@ -218,6 +243,14 @@ pub enum TextureSetError {
         material: String,
         first: usize,
     },
+    /// A variant weight that is not a positive finite number.
+    BadVariantWeight {
+        entry: usize,
+        material: String,
+        weight: f32,
+    },
+    /// More variants across the set than [`MAX_VARIANTS`].
+    TooManyVariants(usize),
     /// Texture arrays require every layer to share one size, so one
     /// mismatched file makes the whole set unusable.
     MismatchedSize {
@@ -275,6 +308,19 @@ impl core::fmt::Display for TextureSetError {
                 "slots {first} and {entry} both use material '{material}'; \
                  each slot is one texture id and needs its own material"
             ),
+            Self::BadVariantWeight {
+                entry,
+                material,
+                weight,
+            } => write!(
+                f,
+                "material '{material}' (slot {entry}) has a tile variant weighted {weight}; \
+                 weights must be above 0"
+            ),
+            Self::TooManyVariants(n) => write!(
+                f,
+                "this terrain's materials have {n} tile variants; the limit is {MAX_VARIANTS}"
+            ),
             Self::MismatchedSize {
                 entry,
                 material,
@@ -306,6 +352,10 @@ impl TextureSet {
         if self.entries.len() > MAX_TEXTURES {
             return Err(TextureSetError::TooManyEntries(self.entries.len()));
         }
+        let variants = self.variant_count();
+        if variants > MAX_VARIANTS {
+            return Err(TextureSetError::TooManyVariants(variants));
+        }
         for (entry, e) in self.entries.iter().enumerate() {
             for path in e.paths() {
                 if crate::sidecar::validate_asset_ref(path).is_err() {
@@ -330,6 +380,17 @@ impl TextureSet {
                     detile: e.detile,
                 });
             }
+            if let Some(variant) = e
+                .variants
+                .iter()
+                .find(|variant| !(variant.weight.is_finite() && variant.weight > 0.0))
+            {
+                return Err(TextureSetError::BadVariantWeight {
+                    entry,
+                    material: e.material.clone(),
+                    weight: variant.weight,
+                });
+            }
             // Vacated ids share the empty name by construction, so only
             // real materials can collide.
             if e.is_vacant() {
@@ -347,6 +408,10 @@ impl TextureSet {
             }
         }
         Ok(())
+    }
+
+    pub fn variant_count(&self) -> usize {
+        self.entries.iter().map(|entry| entry.variants.len()).sum()
     }
 
     /// Number of texture ids this set defines.
@@ -367,16 +432,6 @@ impl TextureSet {
             *slot = entry.uv_scale;
         }
         scales
-    }
-
-    /// Per-id detiling strengths, padded with [`DEFAULT_DETILE`] so an id
-    /// past the end of the set draws with detiling off.
-    pub fn detile_strengths(&self) -> [f32; MAX_TEXTURES] {
-        let mut strengths = [DEFAULT_DETILE; MAX_TEXTURES];
-        for (slot, entry) in strengths.iter_mut().zip(&self.entries) {
-            *slot = entry.detile;
-        }
-        strengths
     }
 
     /// Per-id perceptual roughness each entry sets of its own, `None` past

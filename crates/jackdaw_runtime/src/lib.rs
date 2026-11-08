@@ -136,7 +136,11 @@ pub use material_overrides::{
 #[cfg(feature = "terrain")]
 mod terrain;
 #[cfg(feature = "terrain")]
-pub use jackdaw_terrain::render::{DetailPressers, DetailSettings, DetailViewer};
+pub use jackdaw_terrain::render::{
+    DetailPressers, DetailSettings, DetailViewer, TerrainTileVariety,
+};
+#[cfg(feature = "terrain")]
+pub use jackdaw_terrain::{TileVariant, TileVariety};
 #[cfg(feature = "terrain")]
 pub use terrain::{TerrainHeights, TerrainReady, TerrainViewer};
 

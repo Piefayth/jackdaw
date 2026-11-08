@@ -29,8 +29,8 @@ use jackdaw_terrain::render::{
     DetailDirty, DetailRenderPlugin, DetailSystems, LayerImages, LayerTexels, ScatterDirty,
     ScatterPrefab, ScatterPrefabs, ScatterRenderPlugin, ScatterSystems, SplatArrayHandles,
     SplatBuildError, TerrainDetailSource, TerrainRenderPlugin, TerrainScatter,
-    TerrainSplatMaterial, TextureSetImages, control_image_from_bytes, resolve_with, slope_image,
-    splat_images, tint_image,
+    TerrainSplatMaterial, TerrainTileVariety, TextureSetImages, control_image_from_bytes,
+    resolve_with, slope_image, splat_images, tint_image,
 };
 use jackdaw_terrain::sidecar::{self, TerrainMaterialSlot};
 use jackdaw_terrain::splat::ControlTexels;
@@ -360,6 +360,7 @@ fn resolve_material_slots(
     scenes: Res<Assets<JackdawScene>>,
     standard: Res<Assets<StandardMaterial>>,
     assets: Res<AssetServer>,
+    variety: Option<Res<TerrainTileVariety>>,
     mut terrains: Query<(&TerrainDocument, &mut TerrainSplat)>,
 ) {
     'terrains: for (document, mut splat) in &mut terrains {
@@ -376,11 +377,14 @@ fn resolve_material_slots(
                 DocumentAsset::Missing => {}
             }
         }
-        let resolved = resolve_with(
+        let mut resolved = resolve_with(
             slots,
             |name| materials.get(name).and_then(|handle| standard.get(handle)),
             &assets,
         );
+        if let Some(variety) = &variety {
+            resolved.add_variety(variety, &assets);
+        }
         if splat.slots == *slots && splat.set == resolved.set && splat.missing == resolved.missing {
             continue;
         }

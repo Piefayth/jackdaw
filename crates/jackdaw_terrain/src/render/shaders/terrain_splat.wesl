@@ -48,8 +48,6 @@ const MAX_LAYERS: u32 = 16u;
 struct SplatUniform {
     // 16 per-id UV scales, packed four to a vec4 for uniform alignment.
     uv_scales: array<vec4<f32>, 4>,
-    // 16 per-id detiling strengths, packed the same way. 0 is off.
-    detile_strengths: array<vec4<f32>, 4>,
     // 16 per-id perceptual roughness values a slot sets of its own, packed
     // the same way: a scale on the slot's roughness map, or the roughness
     // where it has none. Negative where it sets none, which leaves the map
@@ -86,6 +84,8 @@ struct SplatUniform {
     roughness_slots: u32,
     normal_slots: u32,
     height_slots: u32,
+    variant_ranges: array<vec4<u32>, 4>,
+    variant_weights: array<vec4<f32>, 16>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> splat: SplatUniform;
@@ -167,15 +167,24 @@ struct LayerSample {
     occlusion: f32,
 }
 
-fn sample_tap(tap: TileTap, slots: LayerSlots) -> LayerSample {
+// `varies` where neighbouring tiles may draw different variants or turns: the
+// texel past a tile's edge then isn't the one its wrap would read, so the
+// smoothing between texels stops at the tile's edge rather than reading it
+fn sample_tap(tap: TileTap, slots: LayerSlots, albedo_layer: i32, turn: u32, varies: bool) -> LayerSample {
     let layer_size = vec2<f32>(textureDimensions(albedo_array));
-    let uv = texel_sharp(tap.uv, tap.ddx, tap.ddy, layer_size);
+    var uv = texel_sharp(tap.uv, tap.ddx, tap.ddy, layer_size);
+    if varies {
+        let tile = floor(tap.uv);
+        let inset = 0.5 / layer_size;
+        uv = clamp(uv, tile + inset, tile + 1.0 - inset);
+    }
     var out: LayerSample;
-    out.albedo = textureSampleGrad(albedo_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).rgb;
+    out.albedo = textureSampleGrad(albedo_array, layer_sampler, uv, albedo_layer, tap.ddx, tap.ddy).rgb;
     out.normal = vec3<f32>(0.0, 0.0, 1.0);
     if slots.has_normal {
         let packed = textureSampleGrad(normal_array, layer_sampler, uv, slots.layer, tap.ddx, tap.ddy).rgb;
         out.normal = packed * 2.0 - 1.0;
+        out.normal = vec3<f32>(unturned(out.normal.xy, turn), out.normal.z);
     }
     out.occlusion = 1.0;
     if slots.has_occlusion {
@@ -232,13 +241,55 @@ fn project(surface: Surface, scale: f32, texels: f32) -> TileTap {
         vec2<f32>(p.x, -p.y), vec2<f32>(dx.x, -dx.y), vec2<f32>(dy.x, -dy.y));
 }
 
+fn turned(v: vec2<f32>, turn: u32) -> vec2<f32> {
+    var out = select(v, v.yx, (turn & 1u) != 0u);
+    out.x = select(out.x, -out.x, (turn & 2u) != 0u);
+    out.y = select(out.y, -out.y, (turn & 4u) != 0u);
+    return out;
+}
+
+fn unturned(v: vec2<f32>, turn: u32) -> vec2<f32> {
+    var out = v;
+    out.x = select(out.x, -out.x, (turn & 2u) != 0u);
+    out.y = select(out.y, -out.y, (turn & 4u) != 0u);
+    return select(out, out.yx, (turn & 1u) != 0u);
+}
+
 fn sample_layer(layer_id: u32, surface: Surface) -> LayerSample {
     let slots = LayerSlots(
         i32(layer_id),
         ((splat.normal_slots >> layer_id) & 1u) != 0u,
         ((splat.occlusion_slots >> layer_id) & 1u) != 0u,
     );
-    return sample_tap(project(surface, uv_scale_for(layer_id), f32(textureDimensions(albedo_array).x)), slots);
+    var tap = project(surface, uv_scale_for(layer_id), f32(textureDimensions(albedo_array).x));
+    let tile = floor(tap.uv);
+    let hash = pcg3d(vec3<u32>(vec3<i32>(vec2<i32>(tile), i32(layer_id))));
+    let range = splat.variant_ranges[layer_id / 4u][layer_id % 4u];
+
+    var turn = 0u;
+    if (range >> 31u) != 0u {
+        turn = hash.y & 7u;
+        tap = TileTap(
+            tile + 0.5 + turned(tap.uv - tile - 0.5, turn),
+            turned(tap.ddx, turn),
+            turned(tap.ddy, turn),
+        );
+    }
+
+    var albedo_layer = i32(layer_id);
+    let first = range & 0xFFFFu;
+    let count = (range >> 16u) & 0xFFu;
+    if count > 0u {
+        // the variant whose share of the weight the roll lands in
+        let roll = f32(hash.x >> 8u) / 16777216.0;
+        var chosen = 0u;
+        for (var i = 0u; i + 1u < count; i++) {
+            let at = first + i;
+            chosen += u32(roll >= splat.variant_weights[at / 4u][at % 4u]);
+        }
+        albedo_layer = i32(splat.layer_count + first + chosen);
+    }
+    return sample_tap(tap, slots, albedo_layer, turn, (range >> 16u) != 0u);
 }
 
 struct Accum {

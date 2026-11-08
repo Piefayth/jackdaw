@@ -66,7 +66,7 @@ pub use sidecar::{
 pub use splat::{
     ControlTexels, control_cell, control_corner, grid_uv, layers_covered, write_control_rect,
 };
-pub use texture_set::{TextureSet, TextureSetEntry, TextureSetError};
+pub use texture_set::{TextureSet, TextureSetEntry, TextureSetError, TileVariant, TileVariety};
 pub use tint::apply_color_brush;
 #[cfg(feature = "procgen")]
 pub use tint::{color_variation, fill_color_variation};
