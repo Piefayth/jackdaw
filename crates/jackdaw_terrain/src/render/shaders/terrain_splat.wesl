@@ -23,7 +23,6 @@ import bevy_pbr::render::{
         POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
     },
     pbr_functions,
-    pbr_lighting::getDistanceAttenuation,
     pbr_types,
     shadows,
 };
@@ -371,10 +370,20 @@ fn sky_irradiance(direction: vec3<f32>) -> vec3<f32> {
     }
 }
 
+fn source_attenuation(distance_squared: f32, inverse_range_squared: f32, radius: f32) -> f32 {
+    let factor = distance_squared * inverse_range_squared;
+    let window = saturate(1.0 - factor * factor);
+    return window * window / max(distance_squared + radius * radius, 0.0001);
+}
+
 fn point_arriving(id: u32, at: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let light = &clustered_lights.data[id];
     let to_light = (*light).position_radius.xyz - at;
-    let attenuation = getDistanceAttenuation(dot(to_light, to_light), (*light).color_inverse_square_range.w);
+    let attenuation = source_attenuation(
+        dot(to_light, to_light),
+        (*light).color_inverse_square_range.w,
+        (*light).position_radius.w,
+    );
     return (*light).color_inverse_square_range.rgb * attenuation * saturate(dot(n, normalize(to_light)));
 }
 
