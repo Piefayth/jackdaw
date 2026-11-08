@@ -19,6 +19,7 @@ import bevy_pbr::render::{
     mesh_view_bindings::{clustered_lights, lights, view},
     mesh_view_types::{
         DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+        FOG_MODE_LINEAR,
         POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
         POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
     },
@@ -28,6 +29,7 @@ import bevy_pbr::render::{
 };
 import bevy_render::maths::{PI, quat_rotate};
 @if(ENVIRONMENT_MAP) import bevy_pbr::render::mesh_view_bindings::{environment_map_sampler, light_probes};
+@if(DISTANCE_FOG) import bevy_pbr::render::mesh_view_bindings::fog;
 @if(ENVIRONMENT_MAP && MULTIPLE_LIGHT_PROBES_IN_ARRAY)
 import bevy_pbr::render::mesh_view_bindings::diffuse_environment_maps;
 @if(ENVIRONMENT_MAP && !MULTIPLE_LIGHT_PROBES_IN_ARRAY)
@@ -455,6 +457,29 @@ fn terrain_lighting(in: pbr_types::PbrInput) -> vec3<f32> {
     return (diffuse * arriving / PI + ambient) * view.exposure;
 }
 
+const FOG_STEPS: f32 = 16.0;
+
+@if(!DISTANCE_FOG)
+fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>) -> vec3<f32> {
+    return at;
+}
+
+@if(DISTANCE_FOG)
+fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>) -> vec3<f32> {
+    if fog.mode != FOG_MODE_LINEAR {
+        return at;
+    }
+    let start = fog.be.x;
+    let end = fog.be.y;
+    let eye = view.world_position.xyz;
+    let distance = length(at - eye);
+    let level = saturate((distance - start) / max(end - start, 1e-4));
+    let rank = bayer(vec2<u32>(texel & vec2<i32>(3)));
+    let stepped = floor(level * FOG_STEPS + rank) / FOG_STEPS;
+    let rounded = start + stepped * (end - start);
+    return eye + (at - eye) * (rounded / max(distance, 1e-4));
+}
+
 fn bayer(cell: vec2<u32>) -> f32 {
     let lo = cell & vec2<u32>(1u);
     let hi = (cell >> vec2<u32>(1u)) & vec2<u32>(1u);
@@ -566,6 +591,8 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     var out: FragmentOutput;
     out.color = vec4<f32>(terrain_lighting(pbr_input), 1.0);
-    out.color = pbr_functions::main_pass_post_lighting_processing(pbr_input, out.color);
+    var fogged = pbr_input;
+    fogged.world_position = vec4<f32>(stepped_fog_position(lit_at.xyz, dither_cell), 1.0);
+    out.color = pbr_functions::main_pass_post_lighting_processing(fogged, out.color);
     return out;
 }
