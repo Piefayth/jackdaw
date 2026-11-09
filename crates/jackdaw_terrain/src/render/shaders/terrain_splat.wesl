@@ -510,6 +510,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // seamless across a chunk join.
     let local_xz = (in.uv - vec2<f32>(0.5)) * splat.terrain_size;
     let p = vec3<f32>(local_xz.x, in.world_position.y, local_xz.y);
+    let n = normalize(pbr_functions::prepare_world_normal(in.world_normal, false, is_front));
     var surface: Surface;
     surface.p = p;
     surface.ddx = dpdx(p);
@@ -544,8 +545,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let corner = control_corner(g);
     let f = clamp(g - vec2<f32>(corner), vec2<f32>(0.0), vec2<f32>(1.0));
     let broad = broad_normal(corner);
-    surface.steep = saturate((SIDE_START_COS - broad.y) / (SIDE_START_COS - SIDE_END_COS));
-    surface.faces_x = abs(broad.x) > abs(broad.z);
+    surface.steep = max(
+        saturate((SIDE_START_COS - broad.y) / (SIDE_START_COS - SIDE_END_COS)),
+        saturate((SIDE_START_COS - n.y) / (SIDE_START_COS - SIDE_END_COS)),
+    );
+    let broad_x = abs(broad.x) > abs(broad.z);
+    let along = select(abs(n.z), abs(n.x), broad_x);
+    let across = select(abs(n.x), abs(n.z), broad_x);
+    surface.faces_x = select(broad_x, !broad_x, along < 0.5 * across);
 
     // gather order: x = (0, 1), y = (1, 1), z = (1, 0), w = (0, 0)
     let words = textureGather(0, control_map, point_sampler, gather_uv(corner, textureDimensions(control_map)));
