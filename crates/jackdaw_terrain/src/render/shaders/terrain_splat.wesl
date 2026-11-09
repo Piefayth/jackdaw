@@ -569,9 +569,23 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // the second argument is the threshold to use and bayer is what gives us that dither pattern.
     let along_side = select(vec2<f32>(p.x, -p.y), vec2<f32>(p.z, -p.y), surface.faces_x);
     let dither_at = select(local_xz, along_side, surface.steep >= 0.5);
-    let dither_cell = vec2<i32>(floor(dither_at / texel));
+    let footprint = max(length(surface.ddx), length(surface.ddy)) / texel;
+    let cell_size = texel * exp2(max(0.0, ceil(log2(footprint))));
+    let dither_cell = vec2<i32>(floor(dither_at / cell_size));
     let layer_id = dithered_layer(accum, bayer(vec2<u32>(dither_cell & vec2<i32>(3))));
-    let sampled = sample_layer(layer_id, surface);
+    var sampled = sample_layer(layer_id, surface);
+    let blended = smoothstep(0.5, 1.0, footprint);
+    let low = dithered_layer(accum, 0.0);
+    let high = dithered_layer(accum, 0.9999);
+    if blended > 0.0 && low != high {
+        let total = dot(accum.base_weights, vec4<f32>(1.0)) + dot(accum.overlay_weights, vec4<f32>(1.0));
+        let low_share = share_upto(accum, low) / max(total, 1e-6);
+        let under = sample_layer(low, surface);
+        let over = sample_layer(high, surface);
+        sampled.albedo = mix(sampled.albedo, mix(over.albedo, under.albedo, low_share), blended);
+        sampled.normal = normalize(mix(sampled.normal, mix(over.normal, under.normal, low_share), blended));
+        sampled.occlusion = mix(sampled.occlusion, mix(over.occlusion, under.occlusion, low_share), blended);
+    }
     let albedo = sampled.albedo;
     let tangent_normal = sampled.normal;
     let occlusion = sampled.occlusion;
@@ -581,7 +595,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // where the surface stands vertical and faces X, so +Z stands in there.
     // Picking the axis the normal leans on least would swap the frame by 90
     // degrees wherever |n.x| and |n.z| cross, seaming flat ground.
-    let lit_at = texel_position(in.world_position, surface, dither_at, dither_cell, texel);
+    let lit_at = texel_position(in.world_position, surface, dither_at, dither_cell, cell_size);
     let lit_n = ground_normal(corner, f);
     var reference = vec3<f32>(1.0, 0.0, 0.0);
     if abs(lit_n.x) > 0.999 {
@@ -611,11 +625,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var out: FragmentOutput;
     out.color = vec4<f32>(terrain_lighting(pbr_input), 1.0);
     var fogged = pbr_input;
-    fogged.world_position = vec4<f32>(stepped_fog_position(
-        lit_at.xyz,
-        dither_cell,
-        max(length(surface.ddx), length(surface.ddy)) / texel,
-    ), 1.0);
+    fogged.world_position = vec4<f32>(stepped_fog_position(lit_at.xyz, dither_cell, footprint), 1.0);
     out.color = pbr_functions::main_pass_post_lighting_processing(fogged, out.color);
     return out;
 }
