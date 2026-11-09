@@ -154,6 +154,20 @@ fn ground_normal(corner: vec2<i32>, f: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(g.x, sqrt(max(1.0 - dot(g, g), 0.0)), g.y));
 }
 
+fn broad_normal(corner: vec2<i32>) -> vec3<f32> {
+    let last = vec2<i32>(textureDimensions(slope_map)) - 1;
+    var g = vec2<f32>(0.0);
+    for (var dz = -BROAD_REACH; dz <= BROAD_REACH; dz += BROAD_REACH) {
+        for (var dx = -BROAD_REACH; dx <= BROAD_REACH; dx += BROAD_REACH) {
+            g += textureLoad(slope_map, clamp(corner + vec2<i32>(dx, dz), vec2<i32>(0), last), 0).yz;
+        }
+    }
+    g /= 9.0;
+    return normalize(vec3<f32>(g.x, sqrt(max(1.0 - dot(g, g), 0.0)), g.y));
+}
+
+const BROAD_REACH: i32 = 2;
+
 // what the matte lighting reads from a layer; its height and roughness maps
 // change nothing it draws, so they aren't sampled
 struct LayerSlots {
@@ -496,14 +510,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // seamless across a chunk join.
     let local_xz = (in.uv - vec2<f32>(0.5)) * splat.terrain_size;
     let p = vec3<f32>(local_xz.x, in.world_position.y, local_xz.y);
-    let world_normal = pbr_functions::prepare_world_normal(in.world_normal, false, is_front);
-    let n = normalize(world_normal);
     var surface: Surface;
     surface.p = p;
     surface.ddx = dpdx(p);
     surface.ddy = dpdy(p);
-    surface.steep = saturate((SIDE_START_COS - n.y) / (SIDE_START_COS - SIDE_END_COS));
-    surface.faces_x = abs(n.x) > abs(n.z);
 
     @if(DISTANCE_FOG) {
         if fog.mode == FOG_MODE_LINEAR
@@ -533,6 +543,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let g = texel_uv * f32(max(splat.control_resolution, 2u) - 1u);
     let corner = control_corner(g);
     let f = clamp(g - vec2<f32>(corner), vec2<f32>(0.0), vec2<f32>(1.0));
+    let broad = broad_normal(corner);
+    surface.steep = saturate((SIDE_START_COS - broad.y) / (SIDE_START_COS - SIDE_END_COS));
+    surface.faces_x = abs(broad.x) > abs(broad.z);
 
     // gather order: x = (0, 1), y = (1, 1), z = (1, 0), w = (0, 0)
     let words = textureGather(0, control_map, point_sampler, gather_uv(corner, textureDimensions(control_map)));
