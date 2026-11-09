@@ -46,15 +46,11 @@ pub struct SurfaceMeshData {
 ///
 /// Even, so a level's boundary vertices land on the coarser grid. The
 /// vertex budget per level is `(RING_CELLS + 1)^2`.
-pub const RING_CELLS: u32 = 64;
+pub const RING_CELLS: u32 = 256;
 
 /// Levels a terrain is drawn with at most, however large it is. Past this
 /// the outermost level covers more ground per quad.
 pub const MAX_LEVELS: u32 = 8;
-
-/// How coarse the outermost level may get before another level is worth
-/// having: quads per side of the whole terrain.
-const COARSE_BUDGET: u32 = RING_CELLS * 4;
 
 /// One LOD level: a square of quads at one step, minus the square the
 /// finer level covers.
@@ -212,12 +208,11 @@ pub fn clipmap_levels(resolution: u32, viewer: Vec2) -> Vec<ClipmapLevel> {
 
 /// Levels worth drawing a terrain of `cells` quads per edge with.
 fn level_count(cells: u32) -> u32 {
-    for count in 1..MAX_LEVELS {
-        if cells.div_ceil(1 << (count - 1)) <= COARSE_BUDGET {
-            return count;
-        }
+    let mut count = 1;
+    while count < MAX_LEVELS && RING_CELLS << (count - 1) < cells {
+        count += 1;
     }
-    MAX_LEVELS
+    count
 }
 
 /// Round down to a multiple of `step`, for negative coordinates too.

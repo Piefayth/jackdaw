@@ -457,15 +457,15 @@ fn terrain_lighting(in: pbr_types::PbrInput) -> vec3<f32> {
     return (diffuse * arriving / PI + ambient) * view.exposure;
 }
 
-const FOG_STEPS: f32 = 16.0;
+const FOG_STEPS: f32 = 32.0;
 
 @if(!DISTANCE_FOG)
-fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>) -> vec3<f32> {
+fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>, texels_per_pixel: f32) -> vec3<f32> {
     return at;
 }
 
 @if(DISTANCE_FOG)
-fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>) -> vec3<f32> {
+fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>, texels_per_pixel: f32) -> vec3<f32> {
     if fog.mode != FOG_MODE_LINEAR {
         return at;
     }
@@ -473,9 +473,11 @@ fn stepped_fog_position(at: vec3<f32>, texel: vec2<i32>) -> vec3<f32> {
     let end = fog.be.y;
     let eye = view.world_position.xyz;
     let distance = length(at - eye);
-    let level = saturate((distance - start) / max(end - start, 1e-4));
+    let along = saturate((distance - start) / max(end - start, 1e-4));
+    let level = along * along;
     let rank = bayer(vec2<u32>(texel & vec2<i32>(3)));
-    let stepped = floor(level * FOG_STEPS + rank) / FOG_STEPS;
+    let dithered = floor(level * FOG_STEPS + rank) / FOG_STEPS;
+    let stepped = mix(dithered, level, smoothstep(0.5, 1.0, texels_per_pixel));
     let rounded = start + stepped * (end - start);
     return eye + (at - eye) * (rounded / max(distance, 1e-4));
 }
@@ -502,6 +504,23 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     surface.ddy = dpdy(p);
     surface.steep = saturate((SIDE_START_COS - n.y) / (SIDE_START_COS - SIDE_END_COS));
     surface.faces_x = abs(n.x) > abs(n.z);
+
+    @if(DISTANCE_FOG) {
+        if fog.mode == FOG_MODE_LINEAR
+            && distance(in.world_position.xyz, view.world_position.xyz) >= fog.be.y
+        {
+            var hidden = pbr_types::pbr_input_new();
+            hidden.material.flags |= pbr_types::STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
+            hidden.world_position = in.world_position;
+            hidden.frag_coord = in.position;
+            var fogged: FragmentOutput;
+            fogged.color = pbr_functions::main_pass_post_lighting_processing(
+                hidden,
+                vec4<f32>(0.0, 0.0, 0.0, 1.0),
+            );
+            return fogged;
+        }
+    }
 
     // manipulate uvs to be whole texels
     var finest = 0.0;
@@ -592,7 +611,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var out: FragmentOutput;
     out.color = vec4<f32>(terrain_lighting(pbr_input), 1.0);
     var fogged = pbr_input;
-    fogged.world_position = vec4<f32>(stepped_fog_position(lit_at.xyz, dither_cell), 1.0);
+    fogged.world_position = vec4<f32>(stepped_fog_position(
+        lit_at.xyz,
+        dither_cell,
+        max(length(surface.ddx), length(surface.ddy)) / texel,
+    ), 1.0);
     out.color = pbr_functions::main_pass_post_lighting_processing(fogged, out.color);
     return out;
 }

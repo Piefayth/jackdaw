@@ -136,16 +136,6 @@ struct TerrainSplat {
     resurface: bool,
 }
 
-/// Marks the camera a terrain lays its LOD levels around.
-///
-/// Optional. With no camera marked, the viewer is the active `Camera3d` with
-/// the highest `order`. A game whose UI overlay camera has a higher `order`
-/// marks its world camera instead, so the overlay does not pull the finest
-/// ring away from the player. Among several marked cameras, the highest
-/// `order` wins.
-#[derive(Component, Clone, Copy, Debug, Default)]
-pub struct TerrainViewer;
-
 // hacking around jackdaws lack of terrain readiness indicator
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct TerrainReady;
@@ -531,10 +521,8 @@ fn sync_surfaces(
         &Terrain,
         &TerrainDocument,
         &mut TerrainSplat,
-        &GlobalTransform,
     )>,
     surfaces: Query<(Entity, &TerrainSurface, &BuiltLevel, &Mesh3d)>,
-    cameras: Query<(&Camera, &GlobalTransform, Has<TerrainViewer>), With<Camera3d>>,
     // A dedicated server builds these types with no rendering plugins, so
     // there is no mesh store to build a surface into.
     meshes: Option<ResMut<Assets<Mesh>>>,
@@ -544,16 +532,6 @@ fn sync_surfaces(
     let Some(mut meshes) = meshes else {
         return;
     };
-    let Some(viewer) = viewer_position(&cameras) else {
-        // The levels are laid out around a viewer, so with no camera the
-        // terrain never draws.
-        bevy::log::warn_once!(
-            "no active Camera3d, so terrain has no viewer to lay its levels around and \
-             will not draw"
-        );
-        return;
-    };
-
     let fallback = match &untextured {
         Some(res) => res.0.clone(),
         None => {
@@ -568,18 +546,10 @@ fn sync_surfaces(
         }
     };
 
-    for (terrain_entity, terrain, document, mut splat, terrain_transform) in &mut terrains {
-        // The camera in this terrain's grid coordinates, so a moved or
-        // rotated terrain follows the camera the same way an unmoved one does.
-        let local = terrain_transform
-            .affine()
-            .inverse()
-            .transform_point3(viewer);
-        // Extent and placement both come from the stored cells.
+    for (terrain_entity, terrain, document, mut splat) in &mut terrains {
         let shape = document.shape;
-        let cell = shape.size / (shape.resolution.max(2) - 1) as f32;
-        let grid = (Vec2::new(local.x, local.z) - shape.origin) / cell;
-        let levels = jackdaw_terrain::clipmap_levels(shape.resolution, grid);
+        let centre = Vec2::splat(shape.resolution.saturating_sub(1).div_ceil(2) as f32);
+        let levels = jackdaw_terrain::clipmap_levels(shape.resolution, centre);
 
         let resurface = std::mem::take(&mut splat.resurface);
 
@@ -706,32 +676,6 @@ fn sync_surfaces(
             commands.entity(terrain_entity).remove::<TerrainReady>();
         }
     }
-}
-
-/// Where the terrain is being looked at from.
-fn viewer_position(
-    cameras: &Query<(&Camera, &GlobalTransform, Has<TerrainViewer>), With<Camera3d>>,
-) -> Option<Vec3> {
-    viewer_of(
-        cameras
-            .iter()
-            .filter(|(camera, _, _)| camera.is_active)
-            .map(|(camera, transform, marked)| (marked, camera.order, transform.translation()))
-            .collect::<Vec<_>>(),
-    )
-}
-
-/// The viewer among the active 3D cameras, as `(marked, order, position)`.
-///
-/// If any camera is marked with [`TerrainViewer`], only marked cameras are
-/// considered. Otherwise every camera is, and the highest `order` wins.
-fn viewer_of(cameras: Vec<(bool, isize, Vec3)>) -> Option<Vec3> {
-    let any_marked = cameras.iter().any(|(marked, _, _)| *marked);
-    cameras
-        .iter()
-        .filter(|(marked, _, _)| *marked || !any_marked)
-        .max_by_key(|(_, order, _)| *order)
-        .map(|(_, _, position)| *position)
 }
 
 fn surface_mesh(data: jackdaw_terrain::SurfaceMeshData) -> Mesh {
